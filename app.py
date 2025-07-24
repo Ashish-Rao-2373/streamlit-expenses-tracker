@@ -9,7 +9,7 @@ from google.oauth2.service_account import Credentials
 # --- Configuration ---
 st.set_page_config(
     page_title="Dynamic Expense Tracker",
-    page_icon="💰",
+    page_icon="�",
     layout="wide"
 )
 
@@ -115,11 +115,11 @@ if GDRIVE_CONNECTED:
                 expense_category = st.selectbox(
                     "Expense Category",
                     [
-                        "Manaswi","Recharge","Subscriptions", "Swimming", "Football", "🍔 Food & Dining", "🛒 Groceries", 
-                        "🚗 Transportation", "💡 Utilities", "🏠 Housing", "🛍️ Shopping", 
-                        "🎬 Entertainment", "💪 Health & Fitness", "💄 Personal Care", 
-                        "🎓 Education", "🎁 Gifts & Donations", "✈️ Travel", "👶 Kids", 
-                        "🐾 Pets", "💼 Business", "Miscellaneous"
+                        "❤️ Girlfriend", "⛽ Fuel", "📱 Recharge", 
+                        "🍔 Food & Dining", "🛒 Groceries", "🚗 Transportation", "💡 Utilities", 
+                        "🏠 Housing", "🛍️ Shopping", "🎬 Entertainment", "💪 Health & Fitness", 
+                        "💄 Personal Care", "🎓 Education", "🎁 Gifts & Donations", "✈️ Travel", 
+                        "👶 Kids", "🐾 Pets", "💼 Business", "Miscellaneous"
                     ]
                 )
             expense_amount = st.number_input("Amount", min_value=0.01, format="%.2f")
@@ -240,3 +240,4 @@ if GDRIVE_CONNECTED:
                     st.warning("No expenses selected for deletion.")
     else:
         st.info("No expenses to manage.")
+�
