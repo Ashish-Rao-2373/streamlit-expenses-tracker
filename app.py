@@ -115,7 +115,7 @@ if GDRIVE_CONNECTED:
                 expense_category = st.selectbox(
                     "Expense Category",
                     [
-                        "Manaswi", "Swimming", "Football", "🍔 Food & Dining", "🛒 Groceries", 
+                        "Manaswi","Recharge","Subscriptions", "Swimming", "Football", "🍔 Food & Dining", "🛒 Groceries", 
                         "🚗 Transportation", "💡 Utilities", "🏠 Housing", "🛍️ Shopping", 
                         "🎬 Entertainment", "💪 Health & Fitness", "💄 Personal Care", 
                         "🎓 Education", "🎁 Gifts & Donations", "✈️ Travel", "👶 Kids", 
