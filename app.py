@@ -13,6 +13,7 @@ st.set_page_config(
     layout="wide"
 )
 
+
 # --- Google Sheets Connection ---
 # Use st.secrets for authentication
 try:
