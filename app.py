@@ -13,13 +13,12 @@ st.set_page_config(
     layout="wide"
 )
 
-
 # --- Google Sheets Connection ---
 # Use st.secrets for authentication
 try:
     scopes = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
     ]
     creds = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"], scopes=scopes
@@ -29,8 +28,14 @@ try:
     # Open the Google Sheet by its name
     SPREADSHEET_NAME = st.secrets["gcp_service_account"]["sheet_name"]
     spreadsheet = client.open(SPREADSHEET_NAME)
-    worksheet = spreadsheet.worksheet("Expenses")
     
+    # Try to open the worksheet, create it if it doesn't exist
+    try:
+        worksheet = spreadsheet.worksheet("Expenses")
+    except gspread.exceptions.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title="Expenses", rows="1", cols=4)
+        worksheet.append_row(["Date", "Category", "Amount", "Comments"])
+
     # A flag to know if connection is successful
     GDRIVE_CONNECTED = True
 
@@ -52,20 +57,16 @@ def load_data():
             if col not in df.columns:
                 df[col] = None
         
-        df['Date'] = pd.to_datetime(df['Date'])
-        # Ensure Amount is numeric, coercing errors to NaN and then filling with 0
-        df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+        if not df.empty:
+            df['Date'] = pd.to_datetime(df['Date'])
+            # Ensure Amount is numeric, coercing errors to NaN and then filling with 0
+            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+        
         # Add a unique identifier for each row for deletion
         df['id'] = range(len(df))
 
         return df
-    except gspread.exceptions.WorksheetNotFound:
-        # If the worksheet doesn't exist, create it with headers
-        headers = ["Date", "Category", "Amount", "Comments"]
-        spreadsheet.add_worksheet(title="Expenses", rows="1", cols=len(headers))
-        worksheet = spreadsheet.worksheet("Expenses")
-        worksheet.append_row(headers)
-        return pd.DataFrame(columns=headers)
+
     except Exception as e:
         st.error(f"An error occurred while loading data: {e}")
         return pd.DataFrame(columns=["Date", "Category", "Amount", "Comments"])
@@ -81,11 +82,12 @@ def save_data(df):
     df_to_save = df.drop(columns=['id'], errors='ignore')
 
     # Convert datetime to string for CSV compatibility
-    df_to_save['Date'] = df_to_save['Date'].dt.strftime('%Y-%m-%d')
+    if not df_to_save.empty:
+        df_to_save['Date'] = pd.to_datetime(df_to_save['Date']).dt.strftime('%Y-%m-%d')
     
     # Clear the sheet and write the new data
     worksheet.clear()
-    set_with_dataframe(worksheet, df_to_save)
+    set_with_dataframe(worksheet, df_to_save, include_index=False, resize=True)
 
 
 # --- Main App ---
