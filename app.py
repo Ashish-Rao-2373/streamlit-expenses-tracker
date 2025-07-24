@@ -9,7 +9,7 @@ from google.oauth2.service_account import Credentials
 # --- Configuration ---
 st.set_page_config(
     page_title="Dynamic Expense Tracker",
-    page_icon="�",
+    page_icon="💰",
     layout="wide"
 )
 
@@ -240,4 +240,3 @@ if GDRIVE_CONNECTED:
                     st.warning("No expenses selected for deletion.")
     else:
         st.info("No expenses to manage.")
-�
