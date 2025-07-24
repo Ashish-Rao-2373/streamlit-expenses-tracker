@@ -56,10 +56,10 @@ with tab1:
             expense_category = st.selectbox(
                 "Expense Category",
                 [
-                    "🍔 Food & Dining", "🛒 Groceries", "🚗 Transportation", "💡 Utilities", 
+                    "Manaswi","🍔 Food & Dining", "🛒 Groceries", "🚗 Transportation", "💡 Utilities", 
                     "🏠 Housing", "🛍️ Shopping", "🎬 Entertainment", "💪 Health & Fitness",
                     "💄 Personal Care", "🎓 Education", "🎁 Gifts & Donations", "✈️ Travel",
-                    "👶 Kids", "🐾 Pets", "💼 Business", " miscellaneous"
+                    "👶 Swimming", "🐾 Pets", "Football", " miscellaneous"
                 ]
             )
             
@@ -107,7 +107,7 @@ with tab2:
     else:
         # Display total expenses for the month
         total_monthly_expense = monthly_df['Amount'].sum()
-        st.metric(label=f"Total Expenses for {selected_month} {selected_year}", value=f"${total_monthly_expense:,.2f}")
+        st.metric(label=f"Total Expenses for {selected_month} {selected_year}", value=f"₹{total_monthly_expense:,.2f}")
 
         col1, col2 = st.columns(2)
 
