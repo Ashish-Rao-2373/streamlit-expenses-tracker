@@ -220,7 +220,12 @@ if GDRIVE_CONNECTED:
                 disabled=[col for col in display_df.columns if col != 'Select']
             )
 
-            delete_button = st.form_submit_button("Delete Selected Expenses", type="primary")
+            col1, col2 = st.columns(2)
+            with col1:
+                delete_button = st.form_submit_button("Delete Selected Expenses")
+            with col2:
+                delete_all_button = st.form_submit_button("⚠️ Delete All Expenses", type="primary")
+
 
             if delete_button:
                 selected_rows = edited_df[edited_df.Select]
@@ -238,5 +243,14 @@ if GDRIVE_CONNECTED:
                     st.rerun()
                 else:
                     st.warning("No expenses selected for deletion.")
+            
+            if delete_all_button:
+                # Create an empty dataframe with the correct columns
+                empty_df = pd.DataFrame(columns=["Date", "Category", "Amount", "Comments"])
+                st.session_state.expenses_df = empty_df
+                save_data(st.session_state.expenses_df)
+                st.success("All expenses have been deleted.")
+                st.rerun()
+
     else:
         st.info("No expenses to manage.")
