@@ -115,11 +115,11 @@ if GDRIVE_CONNECTED:
                 expense_category = st.selectbox(
                     "Expense Category",
                     [
-                        "❤️ Girlfriend", "⛽ Fuel & Bike Service", "📱 Recharge & Subscriptions", 
+                        "❤️ Girlfriend", "⛽ Fuel & Bike Service", "📱 Recharge & Subscriptions", "☕ Chai & snacks",
                         "🍔 Food & Dining", "🛒 Groceries", "🚗 Transportation", "💡 Utilities", 
                         "🏠 Housing", "🛍️ Shopping", "🎬 Entertainment", "💪 Health & Fitness", 
                         "💄 Personal Care", "🎓 Education", "🎁 Gifts & Donations", "✈️ Travel", 
-                        "👶 Kids", "🐾 Pets", "💼 Business", "Miscellaneous"
+                        "Miscellaneous"
                     ]
                 )
             expense_amount = st.number_input("Amount", min_value=0.01, format="%.2f")
