@@ -93,8 +93,13 @@ def predict_next_30_days(df):
         return None, "Not enough data points (days) to forecast."
 
     # 2. Initialize and Train the Model
-    # Enable daily_seasonality since we have at least 2 weeks of data now
-    m = Prophet(daily_seasonality=True)
+    # We tweak the parameters to be more conservative (less reactive to spikes)
+    m = Prophet(
+        daily_seasonality=True if len(daily_expenses) > 60 else False,
+        weekly_seasonality=True,
+        yearly_seasonality=False,
+        changepoint_prior_scale=0.01  # Lower value = smoother trend, less overfitting to recent spikes
+    )
     m.fit(daily_expenses)
 
     # 3. Create a dataframe for the future (30 days)
@@ -102,6 +107,11 @@ def predict_next_30_days(df):
     
     # 4. Predict
     forecast = m.predict(future)
+    
+    # Clip negative predictions to 0 (impossible to spend negative money)
+    forecast['yhat'] = forecast['yhat'].clip(lower=0)
+    forecast['yhat_lower'] = forecast['yhat_lower'].clip(lower=0)
+    forecast['yhat_upper'] = forecast['yhat_upper'].clip(lower=0)
     
     return forecast, None
 
@@ -231,6 +241,22 @@ if GDRIVE_CONNECTED:
                     if error_msg:
                         st.warning(error_msg)
                     else:
+                        # Calculate Metrics
+                        future_30_days = forecast[forecast['ds'] > pd.to_datetime("today")].head(30)
+                        predicted_total = future_30_days['yhat'].sum()
+                        
+                        # Calculate Historical Average (Last 30 Days)
+                        today = pd.to_datetime("today")
+                        last_30_days_start = today - timedelta(days=30)
+                        historical_df = st.session_state.expenses_df
+                        last_30_total = historical_df[historical_df['Date'] >= last_30_days_start]['Amount'].sum()
+
+                        # Display Comparison Metrics
+                        m1, m2 = st.columns(2)
+                        m1.metric("Actual Spending (Last 30 Days)", f"₹{last_30_total:,.2f}")
+                        m2.metric("Predicted Spending (Next 30 Days)", f"₹{predicted_total:,.2f}", 
+                                  delta=f"{predicted_total - last_30_total:,.2f}", delta_color="inverse")
+
                         # Create the Plotly chart for forecast
                         fig_forecast = go.Figure()
 
@@ -271,11 +297,7 @@ if GDRIVE_CONNECTED:
                         )
                         
                         st.plotly_chart(fig_forecast, use_container_width=True)
-                        
-                        # Show predicted total
-                        future_30_days = forecast[forecast['ds'] > pd.to_datetime("today")].head(30)
-                        predicted_total = future_30_days['yhat'].sum()
-                        st.success(f"📉 Based on your habits, you are predicted to spend approx **₹{predicted_total:,.2f}** over the next 30 days.")
+                        st.success("Note: The AI prediction is smoothed to avoid overreacting to large one-time expenses.")
 
         else:
             st.info("No expenses recorded yet.")
