@@ -7,6 +7,7 @@ import gspread
 from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
 from prophet import Prophet
+import numpy as np
 
 # --- Configuration ---
 st.set_page_config(
@@ -92,15 +93,26 @@ def predict_next_30_days(df):
     if len(daily_expenses) < 14:
         return None, "Not enough data points (days) to forecast."
 
+    # 1.5 Remove Outliers (Data Cleaning)
+    # We remove extreme spikes (e.g., > 3 standard deviations from mean) so they don't skew the prediction
+    # This prevents one massive expense (like a laptop purchase) from ruining the "habit" forecast.
+    mean_spend = daily_expenses['y'].mean()
+    std_spend = daily_expenses['y'].std()
+    cap = mean_spend + (3 * std_spend)
+    
+    # Filter the data to train only on "normal" spending days
+    train_data = daily_expenses[daily_expenses['y'] < cap].copy()
+
     # 2. Initialize and Train the Model
-    # We tweak the parameters to be more conservative (less reactive to spikes)
+    # Tweaked parameters for a "Calmer" AI
     m = Prophet(
-        daily_seasonality=True if len(daily_expenses) > 60 else False,
-        weekly_seasonality=True,
+        daily_seasonality=False,   # Strictly False for daily data
+        weekly_seasonality=True,   # Keep this to detect "weekend spending"
         yearly_seasonality=False,
-        changepoint_prior_scale=0.01  # Lower value = smoother trend, less overfitting to recent spikes
+        changepoint_prior_scale=0.05, # Default is 0.05, makes trend less reactive
+        seasonality_prior_scale=5.0   # Lower value dampens the "zig-zag" waves
     )
-    m.fit(daily_expenses)
+    m.fit(train_data)
 
     # 3. Create a dataframe for the future (30 days)
     future = m.make_future_dataframe(periods=30)
@@ -108,7 +120,7 @@ def predict_next_30_days(df):
     # 4. Predict
     forecast = m.predict(future)
     
-    # Clip negative predictions to 0 (impossible to spend negative money)
+    # Clip negative predictions to 0
     forecast['yhat'] = forecast['yhat'].clip(lower=0)
     forecast['yhat_lower'] = forecast['yhat_lower'].clip(lower=0)
     forecast['yhat_upper'] = forecast['yhat_upper'].clip(lower=0)
