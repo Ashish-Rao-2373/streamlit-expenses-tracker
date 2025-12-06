@@ -8,6 +8,7 @@ from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
 from prophet import Prophet
 import numpy as np
+import calendar
 
 # --- Configuration ---
 st.set_page_config(
@@ -81,51 +82,55 @@ def save_data(df):
     set_with_dataframe(worksheet, df_to_save, include_index=False, resize=True)
 
 # --- Data Science: Forecasting Function ---
-def predict_next_30_days(df):
+def predict_month_end(df):
     """
-    Uses Facebook Prophet to predict expenses for the next 30 days.
+    Uses Facebook Prophet to predict expenses for the REST of the current month.
     """
-    # 1. Prepare data for Prophet (needs 'ds' for date and 'y' for value)
+    # 1. Prepare data
     daily_expenses = df.groupby("Date")['Amount'].sum().reset_index()
     daily_expenses.columns = ['ds', 'y']
     
-    # Redundant check (UI handles it), but good for safety
     if len(daily_expenses) < 14:
-        return None, "Not enough data points (days) to forecast."
+        return None, "Not enough data points (days) to forecast.", None
 
-    # 1.5 Remove Outliers (Data Cleaning)
-    # We remove extreme spikes (e.g., > 3 standard deviations from mean) so they don't skew the prediction
-    # This prevents one massive expense (like a laptop purchase) from ruining the "habit" forecast.
-    mean_spend = daily_expenses['y'].mean()
-    std_spend = daily_expenses['y'].std()
-    cap = mean_spend + (3 * std_spend)
+    # 1.5 Remove Outliers (IQR Method) - Keep this to stabilize the trend line
+    Q1 = daily_expenses['y'].quantile(0.25)
+    Q3 = daily_expenses['y'].quantile(0.75)
+    IQR = Q3 - Q1
+    cap = Q3 + 1.5 * IQR 
+    train_data = daily_expenses[daily_expenses['y'] <= cap].copy()
     
-    # Filter the data to train only on "normal" spending days
-    train_data = daily_expenses[daily_expenses['y'] < cap].copy()
+    outliers_removed = len(daily_expenses) - len(train_data)
+    debug_msg = f"Filtered {outliers_removed} outliers (> ₹{cap:,.0f}) for trend calculation."
 
-    # 2. Initialize and Train the Model
-    # Tweaked parameters for a "Calmer" AI
+    # 2. Initialize and Train
     m = Prophet(
-        daily_seasonality=False,   # Strictly False for daily data
-        weekly_seasonality=True,   # Keep this to detect "weekend spending"
+        daily_seasonality=False,
+        weekly_seasonality=True,
         yearly_seasonality=False,
-        changepoint_prior_scale=0.05, # Default is 0.05, makes trend less reactive
-        seasonality_prior_scale=5.0   # Lower value dampens the "zig-zag" waves
+        changepoint_prior_scale=0.001, # Flat trend assumption
+        seasonality_prior_scale=0.1
     )
     m.fit(train_data)
 
-    # 3. Create a dataframe for the future (30 days)
-    future = m.make_future_dataframe(periods=30)
+    # 3. Calculate Days Remaining in Current Month
+    today = datetime.now()
+    last_day_of_month = calendar.monthrange(today.year, today.month)[1]
+    days_remaining = last_day_of_month - today.day
     
+    if days_remaining <= 0:
+        return None, "It's the end of the month! No days left to forecast.", None
+
     # 4. Predict
+    future = m.make_future_dataframe(periods=days_remaining)
     forecast = m.predict(future)
     
-    # Clip negative predictions to 0
+    # Clip negative predictions
     forecast['yhat'] = forecast['yhat'].clip(lower=0)
     forecast['yhat_lower'] = forecast['yhat_lower'].clip(lower=0)
     forecast['yhat_upper'] = forecast['yhat_upper'].clip(lower=0)
     
-    return forecast, None
+    return forecast, None, debug_msg
 
 
 # --- Main App ---
@@ -235,81 +240,106 @@ if GDRIVE_CONNECTED:
             
             st.divider()
 
-            # 2. AI Forecasting Section
-            st.subheader("🔮 AI Spending Forecast (Next 30 Days)")
+            # 2. AI Forecasting Section (Current Month Projection)
+            current_month_name = datetime.now().strftime("%B")
+            st.subheader(f"🔮 End-of-Month Projection ({current_month_name})")
             
-            # Data Validity Check for Prediction (Requires 14 Distinct Days)
             unique_days_count = st.session_state.expenses_df['Date'].nunique()
             
             if unique_days_count < 14:
-                st.info(f"⏳ **AI Forecast is unlocking... (Progress: {unique_days_count}/14 days)**\n\nWe need at least 14 days of spending history (distinct dates) to understand your patterns and generate an accurate prediction. Keep tracking!")
+                st.info(f"⏳ **AI Forecast is unlocking... (Progress: {unique_days_count}/14 days)**\n\nWe need at least 14 days of spending history to reliably predict your month-end total.")
                 st.progress(unique_days_count / 14)
             else:
-                st.write("This model uses Facebook Prophet to analyze your daily spending habits and predict future expenses.")
-                if st.button("Generate Forecast"):
-                    with st.spinner("Training AI Model... (This might take a moment)"):
-                        forecast, error_msg = predict_next_30_days(st.session_state.expenses_df)
+                st.write(f"Based on your spending so far in {current_month_name}, here is where you are likely to end up.")
+                
+                if st.button("Generate Projection"):
+                    with st.spinner("Analyzing current month trend..."):
+                        forecast, error_msg, debug_msg = predict_month_end(st.session_state.expenses_df)
                     
                     if error_msg:
                         st.warning(error_msg)
                     else:
-                        # Calculate Metrics
-                        future_30_days = forecast[forecast['ds'] > pd.to_datetime("today")].head(30)
-                        predicted_total = future_30_days['yhat'].sum()
+                        # --- Calculate The Projection Range ---
+                        today = datetime.now()
+                        current_month_start = today.replace(day=1)
                         
-                        # Calculate Historical Average (Last 30 Days)
-                        today = pd.to_datetime("today")
-                        last_30_days_start = today - timedelta(days=30)
-                        historical_df = st.session_state.expenses_df
-                        last_30_total = historical_df[historical_df['Date'] >= last_30_days_start]['Amount'].sum()
+                        # 1. Spent So Far (Actuals)
+                        current_month_data = st.session_state.expenses_df[
+                            (st.session_state.expenses_df['Date'] >= current_month_start) &
+                            (st.session_state.expenses_df['Date'] <= today)
+                        ]
+                        spent_so_far = current_month_data['Amount'].sum()
+                        
+                        # 2. Predicted Remaining (Future)
+                        # Filter forecast to only show dates AFTER today
+                        future_forecast = forecast[forecast['ds'] > pd.to_datetime(today)]
+                        
+                        predicted_remaining_low = future_forecast['yhat_lower'].sum()
+                        predicted_remaining_mid = future_forecast['yhat'].sum()
+                        predicted_remaining_high = future_forecast['yhat_upper'].sum()
+                        
+                        # 3. Total Projected
+                        total_low = spent_so_far + predicted_remaining_low
+                        total_mid = spent_so_far + predicted_remaining_mid
+                        total_high = spent_so_far + predicted_remaining_high
 
-                        # Display Comparison Metrics
-                        m1, m2 = st.columns(2)
-                        m1.metric("Actual Spending (Last 30 Days)", f"₹{last_30_total:,.2f}")
-                        m2.metric("Predicted Spending (Next 30 Days)", f"₹{predicted_total:,.2f}", 
-                                  delta=f"{predicted_total - last_30_total:,.2f}", delta_color="inverse")
+                        # --- Display Results ---
+                        st.metric(f"Already Spent in {current_month_name}", f"₹{spent_so_far:,.2f}")
+                        
+                        st.success(f"🎯 **Projected Total for {current_month_name}: ₹{total_low:,.0f} — ₹{total_high:,.0f}**")
+                        st.caption(f"Most likely outcome: ~₹{total_mid:,.0f}")
+                        
+                        if debug_msg:
+                            st.caption(f"ℹ️ {debug_msg}")
 
-                        # Create the Plotly chart for forecast
+                        # --- Visualization ---
                         fig_forecast = go.Figure()
 
-                        # Plot historical data (Black dots)
+                        # Plot historical data for this month
+                        daily_actuals = current_month_data.groupby("Date")['Amount'].sum().reset_index()
                         fig_forecast.add_trace(go.Scatter(
-                            x=forecast['ds'], 
-                            y=forecast['yhat'],
-                            mode='lines',
-                            name='Trend / Prediction',
-                            line=dict(color='blue')
+                            x=daily_actuals['Date'], 
+                            y=daily_actuals['Amount'],
+                            mode='lines+markers',
+                            name='Actual Spend',
+                            line=dict(color='green', width=3)
                         ))
                         
-                        # Fill area for uncertainty (Confidence Interval)
+                        # Plot forecast
                         fig_forecast.add_trace(go.Scatter(
-                            x=forecast['ds'], 
-                            y=forecast['yhat_upper'],
+                            x=future_forecast['ds'], 
+                            y=future_forecast['yhat'],
+                            mode='lines',
+                            name='Projected Path',
+                            line=dict(color='blue', dash='dot')
+                        ))
+                        
+                        # Confidence Interval
+                        fig_forecast.add_trace(go.Scatter(
+                            x=future_forecast['ds'], 
+                            y=future_forecast['yhat_upper'],
                             mode='lines',
                             line=dict(width=0),
                             showlegend=False,
                             hoverinfo='skip'
                         ))
                         fig_forecast.add_trace(go.Scatter(
-                            x=forecast['ds'], 
-                            y=forecast['yhat_lower'],
+                            x=future_forecast['ds'], 
+                            y=future_forecast['yhat_lower'],
                             mode='lines',
                             fill='tonexty',
                             fillcolor='rgba(0, 0, 255, 0.2)',
                             line=dict(width=0),
-                            name='Confidence Interval'
+                            name='Likely Range'
                         ))
 
-                        # Update layout
                         fig_forecast.update_layout(
-                            title="Projected Daily Spending",
+                            title=f"{current_month_name} Trajectory",
                             xaxis_title="Date",
-                            yaxis_title="Amount (₹)",
+                            yaxis_title="Daily Amount (₹)",
                             hovermode="x"
                         )
-                        
                         st.plotly_chart(fig_forecast, use_container_width=True)
-                        st.success("Note: The AI prediction is smoothed to avoid overreacting to large one-time expenses.")
 
         else:
             st.info("No expenses recorded yet.")
