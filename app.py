@@ -104,13 +104,13 @@ def predict_month_end(df):
     debug_msg = f"Filtered {outliers_removed} outliers (> ₹{cap:,.0f}) for trend calculation."
 
     # 2. Initialize and Train
+    # Reverting interval_width to default (0.80) because we fixed the aggregation math instead
     m = Prophet(
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=False,
         changepoint_prior_scale=0.001, # Flat trend assumption
-        seasonality_prior_scale=0.1,
-        interval_width=0.5 # Tighter confidence interval (50%) to reduce huge ranges
+        seasonality_prior_scale=0.1
     )
     m.fit(train_data)
 
@@ -272,17 +272,24 @@ if GDRIVE_CONNECTED:
                         spent_so_far = current_month_data['Amount'].sum()
                         
                         # 2. Predicted Remaining (Future)
-                        # Filter forecast to only show dates AFTER today
                         future_forecast = forecast[forecast['ds'] > pd.to_datetime(today)]
                         
-                        predicted_remaining_low = future_forecast['yhat_lower'].sum()
                         predicted_remaining_mid = future_forecast['yhat'].sum()
-                        predicted_remaining_high = future_forecast['yhat_upper'].sum()
                         
-                        # 3. Total Projected
-                        total_low = spent_so_far + predicted_remaining_low
+                        # Correct Statistical Aggregation (Square Root Rule)
+                        # Instead of adding up all worst-case days, we calculate the standard error of the sum.
+                        # This assumes errors cancel out partially over time.
+                        daily_uncertainty_gap = future_forecast['yhat_upper'] - future_forecast['yhat']
+                        avg_daily_uncertainty = daily_uncertainty_gap.mean()
+                        days_remaining_count = len(future_forecast)
+                        
+                        # Uncertainty of the Total = Daily Uncertainty * Sqrt(Days)
+                        total_uncertainty = avg_daily_uncertainty * np.sqrt(days_remaining_count)
+                        
+                        # 3. Total Projected Range
                         total_mid = spent_so_far + predicted_remaining_mid
-                        total_high = spent_so_far + predicted_remaining_high
+                        total_low = total_mid - total_uncertainty
+                        total_high = total_mid + total_uncertainty
 
                         # --- Display Results ---
                         st.metric(f"Already Spent in {current_month_name}", f"₹{spent_so_far:,.2f}")
