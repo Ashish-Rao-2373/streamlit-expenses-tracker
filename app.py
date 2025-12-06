@@ -109,7 +109,8 @@ def predict_month_end(df):
         weekly_seasonality=True,
         yearly_seasonality=False,
         changepoint_prior_scale=0.001, # Flat trend assumption
-        seasonality_prior_scale=0.1
+        seasonality_prior_scale=0.1,
+        interval_width=0.5 # Tighter confidence interval (50%) to reduce huge ranges
     )
     m.fit(train_data)
 
