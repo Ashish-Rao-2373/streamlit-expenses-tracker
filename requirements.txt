@@ -5,3 +5,4 @@ gspread
 gspread-dataframe
 google-auth-oauthlib
 prophet
+scikit-learn
