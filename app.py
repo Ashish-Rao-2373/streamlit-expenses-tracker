@@ -84,33 +84,40 @@ def save_data(df):
 # --- Data Science: Forecasting Function ---
 def predict_month_end(df):
     """
-    Uses a Hybrid Approach (Prophet + Historical Average) to predict end-of-month expenses.
-    Separates 'Fixed' (Rent) from 'Variable' expenses to avoid skewing predictions.
+    Uses a robust Statistical Average approach (instead of pure ML trend) 
+    to predict end-of-month expenses, correcting for high variance.
     """
-    # 1. Prepare data
-    # Identify huge outliers/fixed costs first (e.g., Rent > 5000) to separate them
-    # We assume expenses > 5000 are "Fixed Monthly Bills" and shouldn't drive the daily trend
+    # 1. Prepare data & Filter Fixed Costs
     fixed_cost_threshold = 5000
-    
     variable_expenses_df = df[df['Amount'] < fixed_cost_threshold].copy()
     
+    # Calculate daily totals
     daily_expenses = variable_expenses_df.groupby("Date")['Amount'].sum().reset_index()
     daily_expenses.columns = ['ds', 'y']
     
     if len(daily_expenses) < 14:
         return None, "Not enough data points (days) to forecast.", None
 
-    # 2. Initialize and Train Prophet on VARIABLE expenses only
-    # Much tighter controls to prevent it from going wild
-    m = Prophet(
-        daily_seasonality=False,
-        weekly_seasonality=True,
-        yearly_seasonality=False,
-        changepoint_prior_scale=0.05, # Allow some trend flexibility but not too much
-        seasonality_prior_scale=5.0
-    )
-    m.fit(daily_expenses)
+    # 2. Calculate "Habitual Daily Spend" (Robust Statistics)
+    # Instead of trusting Prophet to extrapolate a trend, we calculate the 
+    # median daily spending of the user's history (ignoring zero-spend days to find active spending habit)
+    # Then we assume this habit continues for the remaining days.
+    
+    # Get recent history (last 90 days) to reflect current lifestyle
+    recent_cutoff = pd.to_datetime("today") - timedelta(days=90)
+    recent_data = daily_expenses[daily_expenses['ds'] >= recent_cutoff]
+    
+    if recent_data.empty:
+        recent_data = daily_expenses # Fallback to all data if recent is empty
 
+    # Calculate average daily burn rate (Total Spend / Total Days in period)
+    # We use the total sum divided by the number of days spanned to get a true "burn rate"
+    total_spend_recent = recent_data['y'].sum()
+    days_span = (recent_data['ds'].max() - recent_data['ds'].min()).days + 1
+    if days_span < 1: days_span = 1
+    
+    daily_burn_rate = total_spend_recent / days_span
+    
     # 3. Calculate Days Remaining in Current Month
     today = datetime.now()
     last_day_of_month = calendar.monthrange(today.year, today.month)[1]
@@ -119,31 +126,19 @@ def predict_month_end(df):
     if days_remaining <= 0:
         return None, "It's the end of the month! No days left to forecast.", None
 
-    # 4. Predict Variable Spending
-    future = m.make_future_dataframe(periods=days_remaining)
-    forecast = m.predict(future)
+    # 4. Generate Simple Forecast DataFrame
+    future_dates = [today + timedelta(days=x) for x in range(1, days_remaining + 1)]
+    forecast_df = pd.DataFrame({'ds': future_dates})
     
-    # Clip negative predictions
-    forecast['yhat'] = forecast['yhat'].clip(lower=0)
-    forecast['yhat_lower'] = forecast['yhat_lower'].clip(lower=0)
-    forecast['yhat_upper'] = forecast['yhat_upper'].clip(lower=0)
+    # Base prediction = Daily Burn Rate
+    forecast_df['yhat'] = daily_burn_rate
     
-    # 5. Hybrid Adjustment: Anchor to Historical Average
-    # If the AI predicts something wild (e.g., double the average), pull it back towards the mean.
-    avg_daily_variable_spend = daily_expenses['y'].mean()
-    predicted_daily_avg = forecast.tail(days_remaining)['yhat'].mean()
+    # Uncertainty: +/- 20% standard deviation of burn rate logic
+    # We create a range around the average
+    forecast_df['yhat_lower'] = daily_burn_rate * 0.8
+    forecast_df['yhat_upper'] = daily_burn_rate * 1.2
     
-    # Safety Check: If prediction is > 1.5x of historical average, dampen it.
-    if predicted_daily_avg > (1.5 * avg_daily_variable_spend):
-        dampening_factor = (1.5 * avg_daily_variable_spend) / predicted_daily_avg
-        forecast['yhat'] = forecast['yhat'] * dampening_factor
-        forecast['yhat_upper'] = forecast['yhat_upper'] * dampening_factor
-        forecast['yhat_lower'] = forecast['yhat_lower'] * dampening_factor
-        debug_msg = "Prediction dampened: AI trend was too aggressive compared to history."
-    else:
-        debug_msg = "Prediction aligns with historical spending patterns."
-
-    return forecast, None, debug_msg
+    return forecast_df, None, f"Forecasting based on your recent 90-day average burn rate of ₹{daily_burn_rate:,.2f}/day."
 
 
 # --- Main App ---
@@ -296,21 +291,15 @@ if GDRIVE_CONNECTED:
                                  st.info("ℹ️ We noticed you haven't paid Rent yet this month, so we added ₹7,500 to the projection.")
 
                         # 3. Predicted Remaining Variable Spend (Future)
-                        future_forecast = forecast[forecast['ds'] > pd.to_datetime(today)]
-                        
-                        predicted_variable_mid = future_forecast['yhat'].sum()
-                        
-                        # Correct Statistical Aggregation (Square Root Rule) for Variable Costs
-                        daily_uncertainty_gap = future_forecast['yhat_upper'] - future_forecast['yhat']
-                        avg_daily_uncertainty = daily_uncertainty_gap.mean()
-                        days_remaining_count = len(future_forecast)
-                        
-                        total_variable_uncertainty = avg_daily_uncertainty * np.sqrt(days_remaining_count)
+                        # Summing the daily averages
+                        predicted_variable_mid = forecast['yhat'].sum()
+                        predicted_variable_low = forecast['yhat_lower'].sum()
+                        predicted_variable_high = forecast['yhat_upper'].sum()
                         
                         # 4. Total Projected Range
                         total_mid = spent_so_far + predicted_variable_mid + estimated_future_fixed_costs
-                        total_low = total_mid - total_variable_uncertainty
-                        total_high = total_mid + total_variable_uncertainty
+                        total_low = spent_so_far + predicted_variable_low + estimated_future_fixed_costs
+                        total_high = spent_so_far + predicted_variable_high + estimated_future_fixed_costs
 
                         # --- Display Results ---
                         st.metric(f"Already Spent in {current_month_name}", f"₹{spent_so_far:,.2f}")
@@ -336,8 +325,8 @@ if GDRIVE_CONNECTED:
                         
                         # Plot forecast
                         fig_forecast.add_trace(go.Scatter(
-                            x=future_forecast['ds'], 
-                            y=future_forecast['yhat'],
+                            x=forecast['ds'], 
+                            y=forecast['yhat'],
                             mode='lines',
                             name='Projected Variable Spend',
                             line=dict(color='blue', dash='dot')
@@ -345,16 +334,16 @@ if GDRIVE_CONNECTED:
                         
                         # Confidence Interval
                         fig_forecast.add_trace(go.Scatter(
-                            x=future_forecast['ds'], 
-                            y=future_forecast['yhat_upper'],
+                            x=forecast['ds'], 
+                            y=forecast['yhat_upper'],
                             mode='lines',
                             line=dict(width=0),
                             showlegend=False,
                             hoverinfo='skip'
                         ))
                         fig_forecast.add_trace(go.Scatter(
-                            x=future_forecast['ds'], 
-                            y=future_forecast['yhat_lower'],
+                            x=forecast['ds'], 
+                            y=forecast['yhat_lower'],
                             mode='lines',
                             fill='tonexty',
                             fillcolor='rgba(0, 0, 255, 0.2)',
