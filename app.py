@@ -133,6 +133,8 @@ def predict_category_smart(comment, history_map, nlp_model, all_categories):
     if GEMINI_AVAILABLE:
         try:
             model = genai.GenerativeModel('gemini-2.0-flash')
+            # The prompt string starts here. It uses triple quotes.
+            # Make sure this block is closed properly with """
             prompt = f"""
             You are an expert expense categorizer. Map the expense comment to the most logical category from the list below.
             
@@ -144,12 +146,13 @@ def predict_category_smart(comment, history_map, nlp_model, all_categories):
             - Use common sense (e.g., 'face wash' is Personal Care, 'Uber' is Transportation).
             - 'Manaswi' is a person, likely 'Girlfriend' or 'Gifts' if implies spending on her.
             - Return ONLY the exact category name from the list. Nothing else.
-            """
+            """ 
+            # End of prompt string. Make sure lines below this return to normal color.
+            
             response = model.generate_content(prompt)
             predicted_cat = response.text.strip()
             
             # Verify the LLM returned a valid category
-            # We do a fuzzy check in case LLM adds quotes or mild formatting
             for cat in all_categories:
                 if cat in predicted_cat:
                     return cat, "Gemini AI"
@@ -449,10 +452,4 @@ if GDRIVE_CONNECTED:
     else:
         st.info("No expenses to manage.")
 ```
-
-### ✅ Checklist to Finish:
-1.  **Update `requirements.txt`:** Add `google-generativeai`.
-2.  **Get API Key:** Get it from [Google AI Studio](https://aistudio.google.com/app/apikey).
-3.  **Add Secret:** In Streamlit Secrets (Settings > Secrets), add:
-    ```toml
-    GEMINI_API_KEY = "your-api-key-here"
+```eof
