@@ -9,6 +9,9 @@ from google.oauth2.service_account import Credentials
 from prophet import Prophet
 import numpy as np
 import calendar
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.pipeline import make_pipeline
 
 # --- Configuration ---
 st.set_page_config(
@@ -81,6 +84,33 @@ def save_data(df):
     worksheet.clear()
     set_with_dataframe(worksheet, df_to_save, include_index=False, resize=True)
 
+# --- Data Science: NLP Category Prediction ---
+def train_categorization_model(df):
+    """
+    Trains a simple Naive Bayes model to predict Category based on Comments.
+    """
+    # We need valid comments and categories to train
+    training_data = df.dropna(subset=['Comments', 'Category'])
+    training_data = training_data[training_data['Comments'].str.strip() != '']
+    
+    if len(training_data) < 5:
+        return None # Not enough data to learn yet
+
+    # Create a pipeline: Text Vectorizer -> Naive Bayes Classifier
+    model = make_pipeline(CountVectorizer(), MultinomialNB())
+    model.fit(training_data['Comments'], training_data['Category'])
+    return model
+
+def predict_category(model, comment):
+    """Predicts category from comment using the trained model."""
+    if model is None or not comment or comment.strip() == "":
+        return None
+    try:
+        prediction = model.predict([comment])[0]
+        return prediction
+    except:
+        return None
+
 # --- Data Science: Forecasting Function ---
 def predict_month_end(df):
     """
@@ -91,7 +121,6 @@ def predict_month_end(df):
     fixed_cost_threshold = 5000
     variable_expenses_df = df[df['Amount'] < fixed_cost_threshold].copy()
     
-    # Calculate daily totals (Group by day first to handle multiple expenses in one day)
     daily_expenses = variable_expenses_df.groupby("Date")['Amount'].sum().reset_index()
     daily_expenses.columns = ['ds', 'y']
     
@@ -99,21 +128,16 @@ def predict_month_end(df):
         return None, "Not enough data points (days) to forecast.", None, None
 
     # 2. Calculate "Burn Rate" and "Volatility"
-    # Get recent history (last 90 days) to reflect current lifestyle
     recent_cutoff = pd.to_datetime("today") - timedelta(days=90)
     recent_data = daily_expenses[daily_expenses['ds'] >= recent_cutoff]
     
     if recent_data.empty:
         recent_data = daily_expenses 
 
-    # A) BURN RATE (The Average): Handles the "Zero Days" correctly
-    # We sum all money spent and divide by the total DAYS passed (including zero spend days)
-    # This automatically accounts for the fact that you don't spend every day.
     total_spend_recent = recent_data['y'].sum()
     first_date = recent_data['ds'].min()
     last_date = recent_data['ds'].max()
     
-    # Avoid division by zero
     if pd.isna(first_date): 
         days_span = 1
     else:
@@ -121,9 +145,6 @@ def predict_month_end(df):
         
     daily_burn_rate = total_spend_recent / max(1, days_span)
     
-    # B) VOLATILITY (Standard Deviation): Handles the "1000 vs 100" swings
-    # We calculate how much your spending typically deviates from the average
-    # We need to re-index to include 0-spend days for accurate std dev
     all_dates = pd.date_range(start=first_date, end=last_date)
     recent_data_indexed = recent_data.set_index('ds').reindex(all_dates, fill_value=0)
     daily_volatility = recent_data_indexed['y'].std()
@@ -140,15 +161,10 @@ def predict_month_end(df):
     future_dates = [today + timedelta(days=x) for x in range(1, days_remaining + 1)]
     forecast_df = pd.DataFrame({'ds': future_dates})
     
-    # Base Prediction
     forecast_df['yhat'] = daily_burn_rate
+    forecast_df['yhat_lower'] = daily_burn_rate 
+    forecast_df['yhat_upper'] = daily_burn_rate 
     
-    # Range Calculation (Cumulative Standard Error logic)
-    # Uncertainty grows with the square root of time
-    forecast_df['yhat_lower'] = daily_burn_rate # Base line
-    forecast_df['yhat_upper'] = daily_burn_rate # Base line
-    
-    # We pass the volatility metric back to the UI to calculate the total range correctly
     return forecast_df, None, f"Based on your recent avg spend of ₹{daily_burn_rate:,.0f}/day (±₹{daily_volatility:,.0f})", daily_volatility
 
 
@@ -159,6 +175,8 @@ st.write("This app saves your expenses to a centralized Google Sheet, accessible
 if GDRIVE_CONNECTED:
     if 'expenses_df' not in st.session_state:
         st.session_state.expenses_df = load_data()
+        # Train NLP model on startup
+        st.session_state.nlp_model = train_categorization_model(st.session_state.expenses_df)
 
     # --- Define Tabs ---
     tab1, tab2, tab3 = st.tabs(["📝 Add Expense", "📊 Monthly Dashboard", "📈 Analysis & AI Forecast"])
@@ -166,37 +184,61 @@ if GDRIVE_CONNECTED:
     # --- Tab 1: Add Expense ---
     with tab1:
         st.header("Add a New Expense")
-        with st.form("expense_form", clear_on_submit=True):
-            col1, col2 = st.columns(2)
-            with col1:
-                expense_date = st.date_input("Date of Expense", datetime.now())
-            with col2:
-                expense_category = st.selectbox(
-                    "Expense Category",
-                    [
-                        "❤️ Girlfriend", "⛽ Fuel & Bike Service", "📱 Recharge & Subscriptions", "☕ Chai & snacks", "⚽ Sports",
-                        "🍔 Food & Dining", "🛒 Groceries", "🚗 Transportation", "💡 Utilities", 
-                        "🏠 Housing", "🛍️ Shopping", "🎬 Entertainment", "💪 Health & Fitness", 
-                        "💄 Personal Care", "🎓 Education", "🎁 Gifts & Donations", "✈️ Travel", 
-                        "Miscellaneous"
-                    ]
-                )
-            expense_amount = st.number_input("Amount", min_value=0.01, format="%.2f")
-            expense_comments = st.text_area("Comments (Optional)")
+        
+        # We use a container to organize the inputs, but NOT st.form
+        # This allows the "Comments" field to trigger a reload for auto-categorization
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            expense_date = st.date_input("Date of Expense", datetime.now())
             
-            submitted = st.form_submit_button("Add Expense")
-            if submitted:
-                new_expense = pd.DataFrame([{
-                    "Date": pd.to_datetime(expense_date),
-                    "Category": expense_category,
-                    "Amount": expense_amount,
-                    "Comments": expense_comments
-                }])
-                updated_df = pd.concat([st.session_state.expenses_df, new_expense], ignore_index=True)
-                st.session_state.expenses_df = updated_df
-                save_data(st.session_state.expenses_df)
-                st.success("Expense added successfully and saved to Google Sheets!")
-                st.rerun()
+            # 1. Comments Input (Key for NLP)
+            # When user types here and hits enter, the app reloads and runs the prediction logic below
+            expense_comments = st.text_input("Comments (Type this first for Magic!)", 
+                                           placeholder="e.g., Uber to office, Lunch at cafe...")
+
+        with col2:
+            # 2. NLP Prediction Logic
+            # Check if model exists and comment is present
+            suggested_index = 0
+            all_categories = [
+                "❤️ Girlfriend", "⛽ Fuel & Bike Service", "📱 Recharge & Subscriptions", "☕ Chai & snacks", "⚽ Sports",
+                "🍔 Food & Dining", "🛒 Groceries", "🚗 Transportation", "💡 Utilities", 
+                "🏠 Housing", "🛍️ Shopping", "🎬 Entertainment", "💪 Health & Fitness", 
+                "💄 Personal Care", "🎓 Education", "🎁 Gifts & Donations", "✈️ Travel", 
+                "Miscellaneous"
+            ]
+            
+            if 'nlp_model' in st.session_state and st.session_state.nlp_model and expense_comments:
+                predicted_cat = predict_category(st.session_state.nlp_model, expense_comments)
+                if predicted_cat and predicted_cat in all_categories:
+                    suggested_index = all_categories.index(predicted_cat)
+                    st.toast(f"🤖 AI detected category: **{predicted_cat}**", icon="✨")
+
+            # Category Selectbox (defaults to AI prediction if available)
+            expense_category = st.selectbox("Expense Category", all_categories, index=suggested_index)
+
+        # Amount Input
+        expense_amount = st.number_input("Amount", min_value=0.01, format="%.2f")
+        
+        # Submit Button (Manual because we removed st.form)
+        if st.button("Add Expense", type="primary"):
+            new_expense = pd.DataFrame([{
+                "Date": pd.to_datetime(expense_date),
+                "Category": expense_category,
+                "Amount": expense_amount,
+                "Comments": expense_comments
+            }])
+            updated_df = pd.concat([st.session_state.expenses_df, new_expense], ignore_index=True)
+            st.session_state.expenses_df = updated_df
+            save_data(st.session_state.expenses_df)
+            
+            # Retrain model with new data for next time
+            st.session_state.nlp_model = train_categorization_model(st.session_state.expenses_df)
+            
+            st.success("Expense added successfully and saved to Google Sheets!")
+            # Note: We can't clear inputs easily without st.form, but Streamlit reruns usually handle flow well.
+            # Ideally we might use session state keys to clear, but for simplicity we let it persist or user clears.
 
     # --- Tab 2: Monthly Dashboard ---
     with tab2:
@@ -345,7 +387,6 @@ if GDRIVE_CONNECTED:
                         future_forecast['Cumulative_yhat'] = start_amount + future_forecast['yhat'].cumsum()
                         
                         # Calculate the uncertainty cone (expanding over time)
-                        # We use the total_variable_uncertainty calculated earlier, but spread it out
                         days_out = np.arange(1, len(future_forecast) + 1)
                         # Scale the volatility by sqrt(days) to create the correct cone shape
                         spread = daily_std * np.sqrt(days_out)
@@ -353,7 +394,7 @@ if GDRIVE_CONNECTED:
                         future_forecast['Cumulative_yhat_lower'] = future_forecast['Cumulative_yhat'] - spread
                         future_forecast['Cumulative_yhat_upper'] = future_forecast['Cumulative_yhat'] + spread
 
-                        # Connector (to join the Green and Blue lines)
+                        # Connector
                         last_actual_date = current_month_data['Date'].max() if not current_month_data.empty else today
                         connector_row = pd.DataFrame({
                             'ds': [last_actual_date],
