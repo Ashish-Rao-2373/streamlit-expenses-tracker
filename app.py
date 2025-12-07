@@ -84,61 +84,72 @@ def save_data(df):
 # --- Data Science: Forecasting Function ---
 def predict_month_end(df):
     """
-    Uses a robust Statistical Average approach (instead of pure ML trend) 
-    to predict end-of-month expenses, correcting for high variance.
+    Uses 'Average Burn Rate' + 'Standard Deviation' to handle volatile spending patterns.
+    This effectively smooths out the 0 vs 1000 days into a steady prediction.
     """
     # 1. Prepare data & Filter Fixed Costs
     fixed_cost_threshold = 5000
     variable_expenses_df = df[df['Amount'] < fixed_cost_threshold].copy()
     
-    # Calculate daily totals
+    # Calculate daily totals (Group by day first to handle multiple expenses in one day)
     daily_expenses = variable_expenses_df.groupby("Date")['Amount'].sum().reset_index()
     daily_expenses.columns = ['ds', 'y']
     
     if len(daily_expenses) < 14:
-        return None, "Not enough data points (days) to forecast.", None
+        return None, "Not enough data points (days) to forecast.", None, None
 
-    # 2. Calculate "Habitual Daily Spend" (Robust Statistics)
-    # Instead of trusting Prophet to extrapolate a trend, we calculate the 
-    # median daily spending of the user's history (ignoring zero-spend days to find active spending habit)
-    # Then we assume this habit continues for the remaining days.
-    
+    # 2. Calculate "Burn Rate" and "Volatility"
     # Get recent history (last 90 days) to reflect current lifestyle
     recent_cutoff = pd.to_datetime("today") - timedelta(days=90)
     recent_data = daily_expenses[daily_expenses['ds'] >= recent_cutoff]
     
     if recent_data.empty:
-        recent_data = daily_expenses # Fallback to all data if recent is empty
+        recent_data = daily_expenses 
 
-    # Calculate average daily burn rate (Total Spend / Total Days in period)
-    # We use the total sum divided by the number of days spanned to get a true "burn rate"
+    # A) BURN RATE (The Average): Handles the "Zero Days" correctly
+    # We sum all money spent and divide by the total DAYS passed (including zero spend days)
+    # This automatically accounts for the fact that you don't spend every day.
     total_spend_recent = recent_data['y'].sum()
-    days_span = (recent_data['ds'].max() - recent_data['ds'].min()).days + 1
-    if days_span < 1: days_span = 1
+    first_date = recent_data['ds'].min()
+    last_date = recent_data['ds'].max()
     
-    daily_burn_rate = total_spend_recent / days_span
+    # Avoid division by zero
+    if pd.isna(first_date): 
+        days_span = 1
+    else:
+        days_span = (last_date - first_date).days + 1
+        
+    daily_burn_rate = total_spend_recent / max(1, days_span)
     
-    # 3. Calculate Days Remaining in Current Month
+    # B) VOLATILITY (Standard Deviation): Handles the "1000 vs 100" swings
+    # We calculate how much your spending typically deviates from the average
+    # We need to re-index to include 0-spend days for accurate std dev
+    all_dates = pd.date_range(start=first_date, end=last_date)
+    recent_data_indexed = recent_data.set_index('ds').reindex(all_dates, fill_value=0)
+    daily_volatility = recent_data_indexed['y'].std()
+
+    # 3. Calculate Days Remaining
     today = datetime.now()
     last_day_of_month = calendar.monthrange(today.year, today.month)[1]
     days_remaining = last_day_of_month - today.day
     
     if days_remaining <= 0:
-        return None, "It's the end of the month! No days left to forecast.", None
+        return None, "It's the end of the month! No days left to forecast.", None, None
 
-    # 4. Generate Simple Forecast DataFrame
+    # 4. Generate Forecast
     future_dates = [today + timedelta(days=x) for x in range(1, days_remaining + 1)]
     forecast_df = pd.DataFrame({'ds': future_dates})
     
-    # Base prediction = Daily Burn Rate
+    # Base Prediction
     forecast_df['yhat'] = daily_burn_rate
     
-    # Uncertainty: +/- 20% standard deviation of burn rate logic
-    # We create a range around the average
-    forecast_df['yhat_lower'] = daily_burn_rate * 0.8
-    forecast_df['yhat_upper'] = daily_burn_rate * 1.2
+    # Range Calculation (Cumulative Standard Error logic)
+    # Uncertainty grows with the square root of time
+    forecast_df['yhat_lower'] = daily_burn_rate # Base line
+    forecast_df['yhat_upper'] = daily_burn_rate # Base line
     
-    return forecast_df, None, f"Forecasting based on your recent 90-day average burn rate of ₹{daily_burn_rate:,.2f}/day."
+    # We pass the volatility metric back to the UI to calculate the total range correctly
+    return forecast_df, None, f"Based on your recent avg spend of ₹{daily_burn_rate:,.0f}/day (±₹{daily_volatility:,.0f})", daily_volatility
 
 
 # --- Main App ---
@@ -262,7 +273,7 @@ if GDRIVE_CONNECTED:
                 
                 if st.button("Generate Projection"):
                     with st.spinner("Analyzing current month trend..."):
-                        forecast, error_msg, debug_msg = predict_month_end(st.session_state.expenses_df)
+                        forecast, error_msg, debug_msg, daily_std = predict_month_end(st.session_state.expenses_df)
                     
                     if error_msg:
                         st.warning(error_msg)
@@ -278,28 +289,30 @@ if GDRIVE_CONNECTED:
                         ]
                         spent_so_far = current_month_data['Amount'].sum()
                         
-                        # 2. Check for Future Fixed Costs (Rent) in this month
-                        # We assume if you haven't paid Rent (>=5000) yet this month, you probably will.
-                        # BUT, if you already paid it, we don't add it again.
+                        # 2. Check for Future Fixed Costs (Rent)
                         has_paid_rent_this_month = any(current_month_data['Amount'] >= 5000)
                         estimated_future_fixed_costs = 0
                         if not has_paid_rent_this_month:
-                             # Check if user typically pays rent. If history shows >5000 payments, assume yes.
                              historical_rents = st.session_state.expenses_df[st.session_state.expenses_df['Amount'] >= 5000]
                              if not historical_rents.empty:
-                                 estimated_future_fixed_costs = 7500 # Assuming ~7500 based on your csv data
+                                 estimated_future_fixed_costs = 7500
                                  st.info("ℹ️ We noticed you haven't paid Rent yet this month, so we added ₹7,500 to the projection.")
 
-                        # 3. Predicted Remaining Variable Spend (Future)
-                        # Summing the daily averages
-                        predicted_variable_mid = forecast['yhat'].sum()
-                        predicted_variable_low = forecast['yhat_lower'].sum()
-                        predicted_variable_high = forecast['yhat_upper'].sum()
+                        # 3. Predicted Remaining Variable Spend
+                        future_forecast = forecast[forecast['ds'] > pd.to_datetime(today)]
+                        days_remaining = len(future_forecast)
+                        
+                        predicted_variable_mid = future_forecast['yhat'].sum()
+                        
+                        # SQUARE ROOT RULE for Total Uncertainty
+                        # If you spend +/- 500 each day, for 30 days the range isn't 30*500 (15000).
+                        # It is 500 * sqrt(30) = 2738. This is how randomness cancels out.
+                        total_variable_uncertainty = daily_std * np.sqrt(days_remaining)
                         
                         # 4. Total Projected Range
                         total_mid = spent_so_far + predicted_variable_mid + estimated_future_fixed_costs
-                        total_low = spent_so_far + predicted_variable_low + estimated_future_fixed_costs
-                        total_high = spent_so_far + predicted_variable_high + estimated_future_fixed_costs
+                        total_low = total_mid - total_variable_uncertainty
+                        total_high = total_mid + total_variable_uncertainty
 
                         # --- Display Results ---
                         st.metric(f"Already Spent in {current_month_name}", f"₹{spent_so_far:,.2f}")
@@ -310,40 +323,65 @@ if GDRIVE_CONNECTED:
                         if debug_msg:
                             st.caption(f"ℹ️ {debug_msg}")
 
-                        # --- Visualization ---
+                        # --- Visualization (CUMULATIVE) ---
                         fig_forecast = go.Figure()
 
-                        # Plot historical data for this month
-                        daily_actuals = current_month_data.groupby("Date")['Amount'].sum().reset_index()
+                        # Plot Actuals
+                        current_month_data = current_month_data.sort_values('Date')
+                        current_month_data['Cumulative_Amount'] = current_month_data['Amount'].cumsum()
+                        
                         fig_forecast.add_trace(go.Scatter(
-                            x=daily_actuals['Date'], 
-                            y=daily_actuals['Amount'],
+                            x=current_month_data['Date'], 
+                            y=current_month_data['Cumulative_Amount'],
                             mode='lines+markers',
                             name='Actual Spend',
                             line=dict(color='green', width=3)
                         ))
                         
-                        # Plot forecast
+                        # Plot Forecast Line
+                        start_amount = spent_so_far
+                        
+                        # Create visual forecast path
+                        future_forecast = forecast.copy()
+                        # Add cumulative sum to start amount
+                        future_forecast['Cumulative_yhat'] = start_amount + future_forecast['yhat'].cumsum()
+                        
+                        # Add the "uncertainty cone" visually using simple spread
+                        # We linearly expand the cone for visualization purposes
+                        spread = np.linspace(0, total_variable_uncertainty, len(future_forecast))
+                        future_forecast['Cumulative_yhat_lower'] = future_forecast['Cumulative_yhat'] - spread
+                        future_forecast['Cumulative_yhat_upper'] = future_forecast['Cumulative_yhat'] + spread
+
+                        # Connector
+                        last_actual_date = current_month_data['Date'].max() if not current_month_data.empty else today
+                        connector_row = pd.DataFrame({
+                            'ds': [last_actual_date],
+                            'Cumulative_yhat': [start_amount],
+                            'Cumulative_yhat_lower': [start_amount],
+                            'Cumulative_yhat_upper': [start_amount]
+                        })
+                        
+                        plot_forecast = pd.concat([connector_row, future_forecast[['ds', 'Cumulative_yhat', 'Cumulative_yhat_lower', 'Cumulative_yhat_upper']]]).sort_values('ds')
+
                         fig_forecast.add_trace(go.Scatter(
-                            x=forecast['ds'], 
-                            y=forecast['yhat'],
+                            x=plot_forecast['ds'], 
+                            y=plot_forecast['Cumulative_yhat'],
                             mode='lines',
-                            name='Projected Variable Spend',
+                            name='Projected Trajectory',
                             line=dict(color='blue', dash='dot')
                         ))
                         
-                        # Confidence Interval
                         fig_forecast.add_trace(go.Scatter(
-                            x=forecast['ds'], 
-                            y=forecast['yhat_upper'],
+                            x=plot_forecast['ds'], 
+                            y=plot_forecast['Cumulative_yhat_upper'],
                             mode='lines',
                             line=dict(width=0),
                             showlegend=False,
                             hoverinfo='skip'
                         ))
                         fig_forecast.add_trace(go.Scatter(
-                            x=forecast['ds'], 
-                            y=forecast['yhat_lower'],
+                            x=plot_forecast['ds'], 
+                            y=plot_forecast['Cumulative_yhat_lower'],
                             mode='lines',
                             fill='tonexty',
                             fillcolor='rgba(0, 0, 255, 0.2)',
@@ -352,9 +390,9 @@ if GDRIVE_CONNECTED:
                         ))
 
                         fig_forecast.update_layout(
-                            title=f"{current_month_name} Trajectory (Excluding Rent Spikes)",
+                            title=f"{current_month_name} Cumulative Spending Trajectory",
                             xaxis_title="Date",
-                            yaxis_title="Daily Amount (₹)",
+                            yaxis_title="Total Spent So Far (₹)",
                             hovermode="x"
                         )
                         st.plotly_chart(fig_forecast, use_container_width=True)
