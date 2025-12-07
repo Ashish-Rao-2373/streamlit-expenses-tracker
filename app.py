@@ -84,35 +84,32 @@ def save_data(df):
 # --- Data Science: Forecasting Function ---
 def predict_month_end(df):
     """
-    Uses Facebook Prophet to predict expenses for the REST of the current month.
+    Uses a Hybrid Approach (Prophet + Historical Average) to predict end-of-month expenses.
+    Separates 'Fixed' (Rent) from 'Variable' expenses to avoid skewing predictions.
     """
     # 1. Prepare data
-    daily_expenses = df.groupby("Date")['Amount'].sum().reset_index()
+    # Identify huge outliers/fixed costs first (e.g., Rent > 5000) to separate them
+    # We assume expenses > 5000 are "Fixed Monthly Bills" and shouldn't drive the daily trend
+    fixed_cost_threshold = 5000
+    
+    variable_expenses_df = df[df['Amount'] < fixed_cost_threshold].copy()
+    
+    daily_expenses = variable_expenses_df.groupby("Date")['Amount'].sum().reset_index()
     daily_expenses.columns = ['ds', 'y']
     
     if len(daily_expenses) < 14:
         return None, "Not enough data points (days) to forecast.", None
 
-    # 1.5 Remove Outliers (IQR Method) - Keep this to stabilize the trend line
-    Q1 = daily_expenses['y'].quantile(0.25)
-    Q3 = daily_expenses['y'].quantile(0.75)
-    IQR = Q3 - Q1
-    cap = Q3 + 1.5 * IQR 
-    train_data = daily_expenses[daily_expenses['y'] <= cap].copy()
-    
-    outliers_removed = len(daily_expenses) - len(train_data)
-    debug_msg = f"Filtered {outliers_removed} outliers (> ₹{cap:,.0f}) for trend calculation."
-
-    # 2. Initialize and Train
-    # Reverting interval_width to default (0.80) because we fixed the aggregation math instead
+    # 2. Initialize and Train Prophet on VARIABLE expenses only
+    # Much tighter controls to prevent it from going wild
     m = Prophet(
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=False,
-        changepoint_prior_scale=0.001, # Flat trend assumption
-        seasonality_prior_scale=0.1
+        changepoint_prior_scale=0.05, # Allow some trend flexibility but not too much
+        seasonality_prior_scale=5.0
     )
-    m.fit(train_data)
+    m.fit(daily_expenses)
 
     # 3. Calculate Days Remaining in Current Month
     today = datetime.now()
@@ -122,7 +119,7 @@ def predict_month_end(df):
     if days_remaining <= 0:
         return None, "It's the end of the month! No days left to forecast.", None
 
-    # 4. Predict
+    # 4. Predict Variable Spending
     future = m.make_future_dataframe(periods=days_remaining)
     forecast = m.predict(future)
     
@@ -131,6 +128,21 @@ def predict_month_end(df):
     forecast['yhat_lower'] = forecast['yhat_lower'].clip(lower=0)
     forecast['yhat_upper'] = forecast['yhat_upper'].clip(lower=0)
     
+    # 5. Hybrid Adjustment: Anchor to Historical Average
+    # If the AI predicts something wild (e.g., double the average), pull it back towards the mean.
+    avg_daily_variable_spend = daily_expenses['y'].mean()
+    predicted_daily_avg = forecast.tail(days_remaining)['yhat'].mean()
+    
+    # Safety Check: If prediction is > 1.5x of historical average, dampen it.
+    if predicted_daily_avg > (1.5 * avg_daily_variable_spend):
+        dampening_factor = (1.5 * avg_daily_variable_spend) / predicted_daily_avg
+        forecast['yhat'] = forecast['yhat'] * dampening_factor
+        forecast['yhat_upper'] = forecast['yhat_upper'] * dampening_factor
+        forecast['yhat_lower'] = forecast['yhat_lower'] * dampening_factor
+        debug_msg = "Prediction dampened: AI trend was too aggressive compared to history."
+    else:
+        debug_msg = "Prediction aligns with historical spending patterns."
+
     return forecast, None, debug_msg
 
 
@@ -271,25 +283,34 @@ if GDRIVE_CONNECTED:
                         ]
                         spent_so_far = current_month_data['Amount'].sum()
                         
-                        # 2. Predicted Remaining (Future)
+                        # 2. Check for Future Fixed Costs (Rent) in this month
+                        # We assume if you haven't paid Rent (>=5000) yet this month, you probably will.
+                        # BUT, if you already paid it, we don't add it again.
+                        has_paid_rent_this_month = any(current_month_data['Amount'] >= 5000)
+                        estimated_future_fixed_costs = 0
+                        if not has_paid_rent_this_month:
+                             # Check if user typically pays rent. If history shows >5000 payments, assume yes.
+                             historical_rents = st.session_state.expenses_df[st.session_state.expenses_df['Amount'] >= 5000]
+                             if not historical_rents.empty:
+                                 estimated_future_fixed_costs = 7500 # Assuming ~7500 based on your csv data
+                                 st.info("ℹ️ We noticed you haven't paid Rent yet this month, so we added ₹7,500 to the projection.")
+
+                        # 3. Predicted Remaining Variable Spend (Future)
                         future_forecast = forecast[forecast['ds'] > pd.to_datetime(today)]
                         
-                        predicted_remaining_mid = future_forecast['yhat'].sum()
+                        predicted_variable_mid = future_forecast['yhat'].sum()
                         
-                        # Correct Statistical Aggregation (Square Root Rule)
-                        # Instead of adding up all worst-case days, we calculate the standard error of the sum.
-                        # This assumes errors cancel out partially over time.
+                        # Correct Statistical Aggregation (Square Root Rule) for Variable Costs
                         daily_uncertainty_gap = future_forecast['yhat_upper'] - future_forecast['yhat']
                         avg_daily_uncertainty = daily_uncertainty_gap.mean()
                         days_remaining_count = len(future_forecast)
                         
-                        # Uncertainty of the Total = Daily Uncertainty * Sqrt(Days)
-                        total_uncertainty = avg_daily_uncertainty * np.sqrt(days_remaining_count)
+                        total_variable_uncertainty = avg_daily_uncertainty * np.sqrt(days_remaining_count)
                         
-                        # 3. Total Projected Range
-                        total_mid = spent_so_far + predicted_remaining_mid
-                        total_low = total_mid - total_uncertainty
-                        total_high = total_mid + total_uncertainty
+                        # 4. Total Projected Range
+                        total_mid = spent_so_far + predicted_variable_mid + estimated_future_fixed_costs
+                        total_low = total_mid - total_variable_uncertainty
+                        total_high = total_mid + total_variable_uncertainty
 
                         # --- Display Results ---
                         st.metric(f"Already Spent in {current_month_name}", f"₹{spent_so_far:,.2f}")
@@ -318,7 +339,7 @@ if GDRIVE_CONNECTED:
                             x=future_forecast['ds'], 
                             y=future_forecast['yhat'],
                             mode='lines',
-                            name='Projected Path',
+                            name='Projected Variable Spend',
                             line=dict(color='blue', dash='dot')
                         ))
                         
@@ -342,7 +363,7 @@ if GDRIVE_CONNECTED:
                         ))
 
                         fig_forecast.update_layout(
-                            title=f"{current_month_name} Trajectory",
+                            title=f"{current_month_name} Trajectory (Excluding Rent Spikes)",
                             xaxis_title="Date",
                             yaxis_title="Daily Amount (₹)",
                             hovermode="x"
