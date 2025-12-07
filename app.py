@@ -9,7 +9,7 @@ from google.oauth2.service_account import Credentials
 from prophet import Prophet
 import numpy as np
 import calendar
-from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.pipeline import make_pipeline
 
@@ -87,29 +87,63 @@ def save_data(df):
 # --- Data Science: NLP Category Prediction ---
 def train_categorization_model(df):
     """
-    Trains a simple Naive Bayes model to predict Category based on Comments.
+    Trains a TfidfVectorizer + Naive Bayes model to predict Category based on Comments.
+    Uses TF-IDF to better handle unique keywords like 'petrol' vs generic words.
     """
     # We need valid comments and categories to train
     training_data = df.dropna(subset=['Comments', 'Category'])
-    training_data = training_data[training_data['Comments'].str.strip() != '']
+    # Filter out empty comments
+    training_data = training_data[training_data['Comments'].astype(str).str.strip() != '']
     
+    # Needs a bit more data to be useful
     if len(training_data) < 5:
-        return None # Not enough data to learn yet
+        return None 
 
-    # Create a pipeline: Text Vectorizer -> Naive Bayes Classifier
-    model = make_pipeline(CountVectorizer(), MultinomialNB())
-    model.fit(training_data['Comments'], training_data['Category'])
+    # Create a pipeline: TF-IDF Vectorizer -> Naive Bayes Classifier
+    # TF-IDF reduces the impact of frequent words that appear everywhere (like 'the', 'a')
+    # and boosts unique words that appear in specific categories.
+    model = make_pipeline(TfidfVectorizer(stop_words='english'), MultinomialNB())
+    model.fit(training_data['Comments'].astype(str), training_data['Category'])
     return model
 
 def predict_category(model, comment):
-    """Predicts category from comment using the trained model."""
-    if model is None or not comment or comment.strip() == "":
+    """
+    Predicts category from comment using a HYBRID approach:
+    1. Keyword Matching (Hard rules for common synonyms)
+    2. ML Model Prediction (Fallback if no keyword match)
+    """
+    if not comment or comment.strip() == "":
         return None
-    try:
-        prediction = model.predict([comment])[0]
-        return prediction
-    except:
-        return None
+        
+    comment_lower = comment.lower()
+    
+    # 1. HARD-CODED RULES (The "Cheat Sheet")
+    # This overrides the AI for obvious matches
+    keywords = {
+        "⛽ Fuel & Bike Service": ["petrol", "diesel", "gas", "fuel", "bike", "service", "mechanic", "oil change", "air", "puncture"],
+        "🍔 Food & Dining": ["swiggy", "zomato", "restaurant", "cafe", "coffee", "tea", "chai", "dinner", "lunch", "breakfast", "burger", "pizza", "biryani", "mandi"],
+        "🛒 Groceries": ["milk", "eggs", "vegetables", "fruits", "grocery", "supermarket", "dmart", "blinkit", "bigbasket"],
+        "🚗 Transportation": ["uber", "ola", "rapido", "bus", "metro", "train", "flight", "cab", "auto", "taxi", "ticket"],
+        "📱 Recharge & Subscriptions": ["recharge", "jio", "airtel", "vi", "wifi", "broadband", "netflix", "prime", "spotify", "subscription"],
+        "⚽ Sports": ["turf", "badminton", "cricket", "football", "gym", "court", "match"],
+        "❤️ Girlfriend": ["gift", "date", "gf", "love"],
+        "💄 Personal Care": ["haircut", "salon", "medicine", "doctor", "pharmacy", "trim", "shave"]
+    }
+    
+    for category, tags in keywords.items():
+        if any(tag in comment_lower for tag in tags):
+            return category
+
+    # 2. AI MODEL PREDICTION
+    # If no keyword matched, ask the trained model
+    if model:
+        try:
+            prediction = model.predict([comment])[0]
+            return prediction
+        except:
+            return None
+            
+    return None
 
 # --- Data Science: Forecasting Function ---
 def predict_month_end(df):
@@ -209,8 +243,11 @@ if GDRIVE_CONNECTED:
                 "Miscellaneous"
             ]
             
-            if 'nlp_model' in st.session_state and st.session_state.nlp_model and expense_comments:
-                predicted_cat = predict_category(st.session_state.nlp_model, expense_comments)
+            if expense_comments:
+                # Use the session state model if available
+                model_to_use = st.session_state.get('nlp_model')
+                predicted_cat = predict_category(model_to_use, expense_comments)
+                
                 if predicted_cat and predicted_cat in all_categories:
                     suggested_index = all_categories.index(predicted_cat)
                     st.toast(f"🤖 AI detected category: **{predicted_cat}**", icon="✨")
