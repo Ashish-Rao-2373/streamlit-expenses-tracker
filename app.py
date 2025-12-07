@@ -305,8 +305,6 @@ if GDRIVE_CONNECTED:
                         predicted_variable_mid = future_forecast['yhat'].sum()
                         
                         # SQUARE ROOT RULE for Total Uncertainty
-                        # If you spend +/- 500 each day, for 30 days the range isn't 30*500 (15000).
-                        # It is 500 * sqrt(30) = 2738. This is how randomness cancels out.
                         total_variable_uncertainty = daily_std * np.sqrt(days_remaining)
                         
                         # 4. Total Projected Range
@@ -326,7 +324,7 @@ if GDRIVE_CONNECTED:
                         # --- Visualization (CUMULATIVE) ---
                         fig_forecast = go.Figure()
 
-                        # Plot Actuals
+                        # 1. Plot Cumulative Actuals
                         current_month_data = current_month_data.sort_values('Date')
                         current_month_data['Cumulative_Amount'] = current_month_data['Amount'].cumsum()
                         
@@ -334,25 +332,28 @@ if GDRIVE_CONNECTED:
                             x=current_month_data['Date'], 
                             y=current_month_data['Cumulative_Amount'],
                             mode='lines+markers',
-                            name='Actual Spend',
+                            name='Actual Spend So Far',
                             line=dict(color='green', width=3)
                         ))
                         
-                        # Plot Forecast Line
+                        # 2. Prepare Cumulative Forecast
                         start_amount = spent_so_far
                         
                         # Create visual forecast path
                         future_forecast = forecast.copy()
-                        # Add cumulative sum to start amount
+                        # Cumulative sum of daily predictions added to the current total
                         future_forecast['Cumulative_yhat'] = start_amount + future_forecast['yhat'].cumsum()
                         
-                        # Add the "uncertainty cone" visually using simple spread
-                        # We linearly expand the cone for visualization purposes
-                        spread = np.linspace(0, total_variable_uncertainty, len(future_forecast))
+                        # Calculate the uncertainty cone (expanding over time)
+                        # We use the total_variable_uncertainty calculated earlier, but spread it out
+                        days_out = np.arange(1, len(future_forecast) + 1)
+                        # Scale the volatility by sqrt(days) to create the correct cone shape
+                        spread = daily_std * np.sqrt(days_out)
+                        
                         future_forecast['Cumulative_yhat_lower'] = future_forecast['Cumulative_yhat'] - spread
                         future_forecast['Cumulative_yhat_upper'] = future_forecast['Cumulative_yhat'] + spread
 
-                        # Connector
+                        # Connector (to join the Green and Blue lines)
                         last_actual_date = current_month_data['Date'].max() if not current_month_data.empty else today
                         connector_row = pd.DataFrame({
                             'ds': [last_actual_date],
@@ -363,6 +364,7 @@ if GDRIVE_CONNECTED:
                         
                         plot_forecast = pd.concat([connector_row, future_forecast[['ds', 'Cumulative_yhat', 'Cumulative_yhat_lower', 'Cumulative_yhat_upper']]]).sort_values('ds')
 
+                        # Plot Forecast Line
                         fig_forecast.add_trace(go.Scatter(
                             x=plot_forecast['ds'], 
                             y=plot_forecast['Cumulative_yhat'],
@@ -371,6 +373,7 @@ if GDRIVE_CONNECTED:
                             line=dict(color='blue', dash='dot')
                         ))
                         
+                        # Plot Confidence Interval
                         fig_forecast.add_trace(go.Scatter(
                             x=plot_forecast['ds'], 
                             y=plot_forecast['Cumulative_yhat_upper'],
@@ -384,7 +387,7 @@ if GDRIVE_CONNECTED:
                             y=plot_forecast['Cumulative_yhat_lower'],
                             mode='lines',
                             fill='tonexty',
-                            fillcolor='rgba(0, 0, 255, 0.2)',
+                            fillcolor='rgba(0, 0, 255, 0.1)',
                             line=dict(width=0),
                             name='Likely Range'
                         ))
@@ -392,7 +395,7 @@ if GDRIVE_CONNECTED:
                         fig_forecast.update_layout(
                             title=f"{current_month_name} Cumulative Spending Trajectory",
                             xaxis_title="Date",
-                            yaxis_title="Total Spent So Far (₹)",
+                            yaxis_title="Total Spent (₹)",
                             hovermode="x"
                         )
                         st.plotly_chart(fig_forecast, use_container_width=True)
