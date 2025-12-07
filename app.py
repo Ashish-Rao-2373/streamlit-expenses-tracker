@@ -12,6 +12,7 @@ import calendar
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.pipeline import make_pipeline
+import google.generativeai as genai
 
 # --- Configuration ---
 st.set_page_config(
@@ -46,6 +47,14 @@ except Exception as e:
     st.error(f"Failed to connect to Google Sheets. Please check your secrets configuration. Error: {e}")
     GDRIVE_CONNECTED = False
 
+# --- Gemini AI Configuration ---
+GEMINI_AVAILABLE = False
+if "GEMINI_API_KEY" in st.secrets:
+    try:
+        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+        GEMINI_AVAILABLE = True
+    except Exception as e:
+        pass # Fail silently and fall back to other methods
 
 def load_data():
     """Load expense data from the Google Sheet."""
@@ -84,117 +93,134 @@ def save_data(df):
     worksheet.clear()
     set_with_dataframe(worksheet, df_to_save, include_index=False, resize=True)
 
-# --- Data Science: NLP Category Prediction ---
-def train_categorization_model(df):
-    """
-    Trains a TfidfVectorizer + Naive Bayes model to predict Category based on Comments.
-    Uses TF-IDF to better handle unique keywords like 'petrol' vs generic words.
-    """
-    # We need valid comments and categories to train
-    training_data = df.dropna(subset=['Comments', 'Category'])
-    # Filter out empty comments
-    training_data = training_data[training_data['Comments'].astype(str).str.strip() != '']
-    
-    # Needs a bit more data to be useful
-    if len(training_data) < 5:
-        return None 
+# --- Data Science: Improved Categorization ---
+def get_historical_mapping(df):
+    """Creates a dictionary mapping exact past comments to their categories."""
+    if df.empty:
+        return {}
+    valid_data = df.dropna(subset=['Comments', 'Category'])
+    valid_data = valid_data[valid_data['Comments'].astype(str).str.strip() != '']
+    comment_map = valid_data.groupby(valid_data['Comments'].str.lower())['Category'].last().to_dict()
+    return comment_map
 
-    # Create a pipeline: TF-IDF Vectorizer -> Naive Bayes Classifier
-    # TF-IDF reduces the impact of frequent words that appear everywhere (like 'the', 'a')
-    # and boosts unique words that appear in specific categories.
-    model = make_pipeline(TfidfVectorizer(stop_words='english'), MultinomialNB())
+def train_nlp_model(df):
+    """Trains a backup NLP model for unseen comments."""
+    training_data = df.dropna(subset=['Comments', 'Category'])
+    training_data = training_data[training_data['Comments'].astype(str).str.strip() != '']
+    if len(training_data) < 5: return None 
+    model = make_pipeline(TfidfVectorizer(stop_words='english', ngram_range=(1,2)), MultinomialNB(alpha=0.1))
     model.fit(training_data['Comments'].astype(str), training_data['Category'])
     return model
 
-def predict_category(model, comment):
+def predict_category_smart(comment, history_map, nlp_model, all_categories):
     """
-    Predicts category from comment using a HYBRID approach:
-    1. Keyword Matching (Hard rules for common synonyms)
-    2. ML Model Prediction (Fallback if no keyword match)
+    Predicts category using a 4-Step Waterfall approach:
+    1. EXACT HISTORY: Has user typed this before? (e.g. "Manaswi" -> "Girlfriend")
+    2. LLM (Gemini): Use AI reasoning for new concepts ("face wash" -> Personal Care).
+    3. KEYWORD RULES: Common synonyms.
+    4. NLP MODEL: Statistical guess.
     """
     if not comment or comment.strip() == "":
-        return None
+        return None, None
         
-    comment_lower = comment.lower()
+    comment_lower = comment.lower().strip()
     
-    # 1. HARD-CODED RULES (The "Cheat Sheet")
-    # This overrides the AI for obvious matches
+    # STEP 1: History Lookup (Personalization - FASTEST)
+    if comment_lower in history_map:
+        return history_map[comment_lower], "History Match"
+
+    # STEP 2: Gemini LLM (Reasoning - SMARTEST)
+    if GEMINI_AVAILABLE:
+        try:
+            model = genai.GenerativeModel('gemini-2.0-flash')
+            prompt = f"""
+            You are an expert expense categorizer. Map the expense comment to the most logical category from the list below.
+            
+            Categories: {", ".join(all_categories)}
+            
+            Expense Comment: "{comment}"
+            
+            Rules:
+            - Use common sense (e.g., 'face wash' is Personal Care, 'Uber' is Transportation).
+            - 'Manaswi' is a person, likely 'Girlfriend' or 'Gifts' if implies spending on her.
+            - Return ONLY the exact category name from the list. Nothing else.
+            """
+            response = model.generate_content(prompt)
+            predicted_cat = response.text.strip()
+            
+            # Verify the LLM returned a valid category
+            # We do a fuzzy check in case LLM adds quotes or mild formatting
+            for cat in all_categories:
+                if cat in predicted_cat:
+                    return cat, "Gemini AI"
+        except Exception:
+            pass # Fallback if API fails
+
+    # STEP 3: Enhanced Rule-Based Matching (Common Logic - FALLBACK)
     keywords = {
-        "⛽ Fuel & Bike Service": ["petrol", "diesel", "gas", "fuel", "bike", "service", "mechanic", "oil change", "air", "puncture"],
-        "🍔 Food & Dining": ["swiggy", "zomato", "restaurant", "cafe", "coffee", "tea", "chai", "dinner", "lunch", "breakfast", "burger", "pizza", "biryani", "mandi"],
-        "🛒 Groceries": ["milk", "eggs", "vegetables", "fruits", "grocery", "supermarket", "dmart", "blinkit", "bigbasket"],
+        "❤️ Girlfriend": ["manaswi", "gift", "date", "gf", "love", "flower", "chocolate"],
+        "☕ Chai & snacks": ["chai", "tea", "coffee", "snack", "biscuit", "samosa", "puff", "break"],
+        "⚽ Sports": ["swimming", "football", "cricket", "badminton", "turf", "gym", "court", "match", "cap", "goggles", "jersey"],
+        "💄 Personal Care": ["face", "wash", "soap", "shampoo", "hair", "salon", "medicine", "doctor", "pharmacy", "trim", "shave", "cream", "lotion", "dental"],
+        "⛽ Fuel & Bike Service": ["petrol", "diesel", "gas", "fuel", "bike", "service", "mechanic", "oil", "air", "puncture", "honda", "yamaha"],
+        "🍔 Food & Dining": ["swiggy", "zomato", "restaurant", "cafe", "dinner", "lunch", "breakfast", "burger", "pizza", "biryani", "mandi", "tiffin", "idli", "dosa"],
+        "🛒 Groceries": ["milk", "eggs", "curd", "vegetables", "fruits", "grocery", "supermarket", "dmart", "blinkit", "bigbasket", "oil", "rice", "dal"],
         "🚗 Transportation": ["uber", "ola", "rapido", "bus", "metro", "train", "flight", "cab", "auto", "taxi", "ticket"],
-        "📱 Recharge & Subscriptions": ["recharge", "jio", "airtel", "vi", "wifi", "broadband", "netflix", "prime", "spotify", "subscription"],
-        "⚽ Sports": ["turf", "badminton", "cricket", "football", "gym", "court", "match"],
-        "❤️ Girlfriend": ["gift", "date", "gf", "love"],
-        "💄 Personal Care": ["haircut", "salon", "medicine", "doctor", "pharmacy", "trim", "shave"]
+        "📱 Recharge & Subscriptions": ["recharge", "jio", "airtel", "vi", "wifi", "broadband", "netflix", "prime", "spotify", "subscription", "plan"],
+        "🏠 Housing": ["rent", "maintenance", "electricity", "water", "maid", "internet"],
+        "🛍️ Shopping": ["amazon", "flipkart", "myntra", "clothes", "shoe", "shirt", "pant", "jeans"]
     }
     
     for category, tags in keywords.items():
-        if any(tag in comment_lower for tag in tags):
-            return category
+        for tag in tags:
+            if f" {tag} " in f" {comment_lower} " or comment_lower == tag:
+                return category, "Keyword Match"
 
-    # 2. AI MODEL PREDICTION
-    # If no keyword matched, ask the trained model
-    if model:
+    # STEP 4: Simple NLP Prediction (Last Resort)
+    if nlp_model:
         try:
-            prediction = model.predict([comment])[0]
-            return prediction
+            probs = nlp_model.predict_proba([comment])[0]
+            max_prob = np.max(probs)
+            if max_prob > 0.3:
+                prediction = nlp_model.classes_[np.argmax(probs)]
+                return prediction, "Statistical Guess"
         except:
-            return None
+            pass
             
-    return None
+    return None, None
 
 # --- Data Science: Forecasting Function ---
 def predict_month_end(df):
-    """
-    Uses 'Average Burn Rate' + 'Standard Deviation' to handle volatile spending patterns.
-    This effectively smooths out the 0 vs 1000 days into a steady prediction.
-    """
-    # 1. Prepare data & Filter Fixed Costs
+    """Uses 'Average Burn Rate' + 'Standard Deviation' logic."""
     fixed_cost_threshold = 5000
     variable_expenses_df = df[df['Amount'] < fixed_cost_threshold].copy()
-    
     daily_expenses = variable_expenses_df.groupby("Date")['Amount'].sum().reset_index()
     daily_expenses.columns = ['ds', 'y']
     
-    if len(daily_expenses) < 14:
-        return None, "Not enough data points (days) to forecast.", None, None
+    if len(daily_expenses) < 14: return None, "Not enough data points (days) to forecast.", None, None
 
-    # 2. Calculate "Burn Rate" and "Volatility"
     recent_cutoff = pd.to_datetime("today") - timedelta(days=90)
     recent_data = daily_expenses[daily_expenses['ds'] >= recent_cutoff]
-    
-    if recent_data.empty:
-        recent_data = daily_expenses 
+    if recent_data.empty: recent_data = daily_expenses 
 
     total_spend_recent = recent_data['y'].sum()
     first_date = recent_data['ds'].min()
     last_date = recent_data['ds'].max()
-    
-    if pd.isna(first_date): 
-        days_span = 1
-    else:
-        days_span = (last_date - first_date).days + 1
-        
+    days_span = (last_date - first_date).days + 1 if not pd.isna(first_date) else 1
     daily_burn_rate = total_spend_recent / max(1, days_span)
     
     all_dates = pd.date_range(start=first_date, end=last_date)
     recent_data_indexed = recent_data.set_index('ds').reindex(all_dates, fill_value=0)
     daily_volatility = recent_data_indexed['y'].std()
 
-    # 3. Calculate Days Remaining
     today = datetime.now()
     last_day_of_month = calendar.monthrange(today.year, today.month)[1]
     days_remaining = last_day_of_month - today.day
     
-    if days_remaining <= 0:
-        return None, "It's the end of the month! No days left to forecast.", None, None
+    if days_remaining <= 0: return None, "It's the end of the month!", None, None
 
-    # 4. Generate Forecast
     future_dates = [today + timedelta(days=x) for x in range(1, days_remaining + 1)]
     forecast_df = pd.DataFrame({'ds': future_dates})
-    
     forecast_df['yhat'] = daily_burn_rate
     forecast_df['yhat_lower'] = daily_burn_rate 
     forecast_df['yhat_upper'] = daily_burn_rate 
@@ -209,31 +235,19 @@ st.write("This app saves your expenses to a centralized Google Sheet, accessible
 if GDRIVE_CONNECTED:
     if 'expenses_df' not in st.session_state:
         st.session_state.expenses_df = load_data()
-        # Train NLP model on startup
-        st.session_state.nlp_model = train_categorization_model(st.session_state.expenses_df)
+        st.session_state.history_map = get_historical_mapping(st.session_state.expenses_df)
+        st.session_state.nlp_model = train_nlp_model(st.session_state.expenses_df)
 
-    # --- Define Tabs ---
     tab1, tab2, tab3 = st.tabs(["📝 Add Expense", "📊 Monthly Dashboard", "📈 Analysis & AI Forecast"])
 
-    # --- Tab 1: Add Expense ---
     with tab1:
         st.header("Add a New Expense")
-        
-        # We use a container to organize the inputs, but NOT st.form
-        # This allows the "Comments" field to trigger a reload for auto-categorization
         col1, col2 = st.columns(2)
-        
         with col1:
             expense_date = st.date_input("Date of Expense", datetime.now())
-            
-            # 1. Comments Input (Key for NLP)
-            # When user types here and hits enter, the app reloads and runs the prediction logic below
-            expense_comments = st.text_input("Comments (Type this first for Magic!)", 
-                                           placeholder="e.g., Uber to office, Lunch at cafe...")
+            expense_comments = st.text_input("Comments (Type this first for Magic!)", placeholder="e.g., Manaswi gift, swimming cap, petrol...")
 
         with col2:
-            # 2. NLP Prediction Logic
-            # Check if model exists and comment is present
             suggested_index = 0
             all_categories = [
                 "❤️ Girlfriend", "⛽ Fuel & Bike Service", "📱 Recharge & Subscriptions", "☕ Chai & snacks", "⚽ Sports",
@@ -242,23 +256,24 @@ if GDRIVE_CONNECTED:
                 "💄 Personal Care", "🎓 Education", "🎁 Gifts & Donations", "✈️ Travel", 
                 "Miscellaneous"
             ]
+            prediction_source = None
             
             if expense_comments:
-                # Use the session state model if available
-                model_to_use = st.session_state.get('nlp_model')
-                predicted_cat = predict_category(model_to_use, expense_comments)
+                hist_map = st.session_state.get('history_map', {})
+                model = st.session_state.get('nlp_model')
+                # Pass all_categories to the new function
+                predicted_cat, source = predict_category_smart(expense_comments, hist_map, model, all_categories)
                 
                 if predicted_cat and predicted_cat in all_categories:
                     suggested_index = all_categories.index(predicted_cat)
-                    st.toast(f"🤖 AI detected category: **{predicted_cat}**", icon="✨")
+                    prediction_source = source
 
-            # Category Selectbox (defaults to AI prediction if available)
             expense_category = st.selectbox("Expense Category", all_categories, index=suggested_index)
+            if prediction_source:
+                st.caption(f"✨ Auto-selected by: **{prediction_source}**")
 
-        # Amount Input
         expense_amount = st.number_input("Amount", min_value=0.01, format="%.2f")
         
-        # Submit Button (Manual because we removed st.form)
         if st.button("Add Expense", type="primary"):
             new_expense = pd.DataFrame([{
                 "Date": pd.to_datetime(expense_date),
@@ -270,14 +285,12 @@ if GDRIVE_CONNECTED:
             st.session_state.expenses_df = updated_df
             save_data(st.session_state.expenses_df)
             
-            # Retrain model with new data for next time
-            st.session_state.nlp_model = train_categorization_model(st.session_state.expenses_df)
+            # Retrain/Update memory
+            st.session_state.history_map = get_historical_mapping(st.session_state.expenses_df)
+            st.session_state.nlp_model = train_nlp_model(st.session_state.expenses_df)
             
             st.success("Expense added successfully and saved to Google Sheets!")
-            # Note: We can't clear inputs easily without st.form, but Streamlit reruns usually handle flow well.
-            # Ideally we might use session state keys to clear, but for simplicity we let it persist or user clears.
 
-    # --- Tab 2: Monthly Dashboard ---
     with tab2:
         st.header("Monthly Dashboard")
         if not st.session_state.expenses_df.empty:
@@ -315,12 +328,9 @@ if GDRIVE_CONNECTED:
         else:
             st.info("No expenses recorded yet.")
 
-    # --- Tab 3: Analysis & AI Forecast ---
     with tab3:
         st.header("Expense Analysis & AI Forecast")
         if not st.session_state.expenses_df.empty:
-            
-            # 1. Standard Bar Charts
             analysis_df = st.session_state.expenses_df.copy()
             analysis_df['Month'] = analysis_df['Date'].dt.to_period('M').astype(str)
             monthly_summary = analysis_df.groupby('Month')['Amount'].sum().reset_index()
@@ -337,19 +347,15 @@ if GDRIVE_CONNECTED:
                 st.plotly_chart(fig_quarterly, use_container_width=True)
             
             st.divider()
-
-            # 2. AI Forecasting Section (Current Month Projection)
             current_month_name = datetime.now().strftime("%B")
             st.subheader(f"🔮 End-of-Month Projection ({current_month_name})")
             
             unique_days_count = st.session_state.expenses_df['Date'].nunique()
-            
             if unique_days_count < 14:
-                st.info(f"⏳ **AI Forecast is unlocking... (Progress: {unique_days_count}/14 days)**\n\nWe need at least 14 days of spending history to reliably predict your month-end total.")
+                st.info(f"⏳ **AI Forecast is unlocking... (Progress: {unique_days_count}/14 days)**")
                 st.progress(unique_days_count / 14)
             else:
                 st.write(f"Based on your spending so far in {current_month_name}, here is where you are likely to end up.")
-                
                 if st.button("Generate Projection"):
                     with st.spinner("Analyzing current month trend..."):
                         forecast, error_msg, debug_msg, daily_std = predict_month_end(st.session_state.expenses_df)
@@ -357,18 +363,14 @@ if GDRIVE_CONNECTED:
                     if error_msg:
                         st.warning(error_msg)
                     else:
-                        # --- Calculate The Projection Range ---
                         today = datetime.now()
                         current_month_start = today.replace(day=1)
-                        
-                        # 1. Spent So Far (Actuals)
                         current_month_data = st.session_state.expenses_df[
                             (st.session_state.expenses_df['Date'] >= current_month_start) &
                             (st.session_state.expenses_df['Date'] <= today)
                         ]
                         spent_so_far = current_month_data['Amount'].sum()
                         
-                        # 2. Check for Future Fixed Costs (Rent)
                         has_paid_rent_this_month = any(current_month_data['Amount'] >= 5000)
                         estimated_future_fixed_costs = 0
                         if not has_paid_rent_this_month:
@@ -377,111 +379,45 @@ if GDRIVE_CONNECTED:
                                  estimated_future_fixed_costs = 7500
                                  st.info("ℹ️ We noticed you haven't paid Rent yet this month, so we added ₹7,500 to the projection.")
 
-                        # 3. Predicted Remaining Variable Spend
                         future_forecast = forecast[forecast['ds'] > pd.to_datetime(today)]
                         days_remaining = len(future_forecast)
-                        
                         predicted_variable_mid = future_forecast['yhat'].sum()
-                        
-                        # SQUARE ROOT RULE for Total Uncertainty
                         total_variable_uncertainty = daily_std * np.sqrt(days_remaining)
                         
-                        # 4. Total Projected Range
                         total_mid = spent_so_far + predicted_variable_mid + estimated_future_fixed_costs
                         total_low = total_mid - total_variable_uncertainty
                         total_high = total_mid + total_variable_uncertainty
 
-                        # --- Display Results ---
                         st.metric(f"Already Spent in {current_month_name}", f"₹{spent_so_far:,.2f}")
-                        
                         st.success(f"🎯 **Projected Total for {current_month_name}: ₹{total_low:,.0f} — ₹{total_high:,.0f}**")
                         st.caption(f"Most likely outcome: ~₹{total_mid:,.0f}")
-                        
-                        if debug_msg:
-                            st.caption(f"ℹ️ {debug_msg}")
+                        if debug_msg: st.caption(f"ℹ️ {debug_msg}")
 
-                        # --- Visualization (CUMULATIVE) ---
                         fig_forecast = go.Figure()
-
-                        # 1. Plot Cumulative Actuals
                         current_month_data = current_month_data.sort_values('Date')
                         current_month_data['Cumulative_Amount'] = current_month_data['Amount'].cumsum()
+                        fig_forecast.add_trace(go.Scatter(x=current_month_data['Date'], y=current_month_data['Cumulative_Amount'], mode='lines+markers', name='Actual Spend', line=dict(color='green', width=3)))
                         
-                        fig_forecast.add_trace(go.Scatter(
-                            x=current_month_data['Date'], 
-                            y=current_month_data['Cumulative_Amount'],
-                            mode='lines+markers',
-                            name='Actual Spend So Far',
-                            line=dict(color='green', width=3)
-                        ))
-                        
-                        # 2. Prepare Cumulative Forecast
                         start_amount = spent_so_far
-                        
-                        # Create visual forecast path
                         future_forecast = forecast.copy()
-                        # Cumulative sum of daily predictions added to the current total
                         future_forecast['Cumulative_yhat'] = start_amount + future_forecast['yhat'].cumsum()
-                        
-                        # Calculate the uncertainty cone (expanding over time)
                         days_out = np.arange(1, len(future_forecast) + 1)
-                        # Scale the volatility by sqrt(days) to create the correct cone shape
                         spread = daily_std * np.sqrt(days_out)
-                        
                         future_forecast['Cumulative_yhat_lower'] = future_forecast['Cumulative_yhat'] - spread
                         future_forecast['Cumulative_yhat_upper'] = future_forecast['Cumulative_yhat'] + spread
 
-                        # Connector
                         last_actual_date = current_month_data['Date'].max() if not current_month_data.empty else today
-                        connector_row = pd.DataFrame({
-                            'ds': [last_actual_date],
-                            'Cumulative_yhat': [start_amount],
-                            'Cumulative_yhat_lower': [start_amount],
-                            'Cumulative_yhat_upper': [start_amount]
-                        })
-                        
+                        connector_row = pd.DataFrame({'ds': [last_actual_date], 'Cumulative_yhat': [start_amount], 'Cumulative_yhat_lower': [start_amount], 'Cumulative_yhat_upper': [start_amount]})
                         plot_forecast = pd.concat([connector_row, future_forecast[['ds', 'Cumulative_yhat', 'Cumulative_yhat_lower', 'Cumulative_yhat_upper']]]).sort_values('ds')
 
-                        # Plot Forecast Line
-                        fig_forecast.add_trace(go.Scatter(
-                            x=plot_forecast['ds'], 
-                            y=plot_forecast['Cumulative_yhat'],
-                            mode='lines',
-                            name='Projected Trajectory',
-                            line=dict(color='blue', dash='dot')
-                        ))
-                        
-                        # Plot Confidence Interval
-                        fig_forecast.add_trace(go.Scatter(
-                            x=plot_forecast['ds'], 
-                            y=plot_forecast['Cumulative_yhat_upper'],
-                            mode='lines',
-                            line=dict(width=0),
-                            showlegend=False,
-                            hoverinfo='skip'
-                        ))
-                        fig_forecast.add_trace(go.Scatter(
-                            x=plot_forecast['ds'], 
-                            y=plot_forecast['Cumulative_yhat_lower'],
-                            mode='lines',
-                            fill='tonexty',
-                            fillcolor='rgba(0, 0, 255, 0.1)',
-                            line=dict(width=0),
-                            name='Likely Range'
-                        ))
-
-                        fig_forecast.update_layout(
-                            title=f"{current_month_name} Cumulative Spending Trajectory",
-                            xaxis_title="Date",
-                            yaxis_title="Total Spent (₹)",
-                            hovermode="x"
-                        )
+                        fig_forecast.add_trace(go.Scatter(x=plot_forecast['ds'], y=plot_forecast['Cumulative_yhat'], mode='lines', name='Projected Trajectory', line=dict(color='blue', dash='dot')))
+                        fig_forecast.add_trace(go.Scatter(x=plot_forecast['ds'], y=plot_forecast['Cumulative_yhat_upper'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+                        fig_forecast.add_trace(go.Scatter(x=plot_forecast['ds'], y=plot_forecast['Cumulative_yhat_lower'], mode='lines', fill='tonexty', fillcolor='rgba(0, 0, 255, 0.1)', line=dict(width=0), name='Likely Range'))
+                        fig_forecast.update_layout(title=f"{current_month_name} Cumulative Spending Trajectory", xaxis_title="Date", yaxis_title="Total Spent (₹)", hovermode="x")
                         st.plotly_chart(fig_forecast, use_container_width=True)
-
         else:
             st.info("No expenses recorded yet.")
 
-    # --- Delete Expenses Section ---
     st.header("Manage Expenses")
     if not st.session_state.expenses_df.empty:
         with st.form("delete_form"):
@@ -489,37 +425,21 @@ if GDRIVE_CONNECTED:
             display_df['Select'] = False
             cols = ['Select'] + [col for col in display_df.columns if col != 'Select' and col != 'id']
             display_df = display_df[cols]
-            
             st.write("Select expenses to delete:")
-            edited_df = st.data_editor(
-                display_df,
-                hide_index=True,
-                column_config={"Select": st.column_config.CheckboxColumn(required=True)},
-                disabled=[col for col in display_df.columns if col != 'Select']
-            )
-
+            edited_df = st.data_editor(display_df, hide_index=True, column_config={"Select": st.column_config.CheckboxColumn(required=True)}, disabled=[col for col in display_df.columns if col != 'Select'])
             col1, col2 = st.columns(2)
-            with col1:
-                delete_button = st.form_submit_button("Delete Selected Expenses")
-            with col2:
-                delete_all_button = st.form_submit_button("⚠️ Delete All Expenses", type="primary")
+            with col1: delete_button = st.form_submit_button("Delete Selected Expenses")
+            with col2: delete_all_button = st.form_submit_button("⚠️ Delete All Expenses", type="primary")
 
             if delete_button:
                 selected_rows = edited_df[edited_df.Select]
                 if not selected_rows.empty:
-                    indices_to_delete = st.session_state.expenses_df[
-                        st.session_state.expenses_df['Date'].isin(pd.to_datetime(selected_rows['Date'])) &
-                        st.session_state.expenses_df['Amount'].isin(selected_rows['Amount']) &
-                        st.session_state.expenses_df['Category'].isin(selected_rows['Category'])
-                    ].index
-                    
+                    indices_to_delete = st.session_state.expenses_df[st.session_state.expenses_df['Date'].isin(pd.to_datetime(selected_rows['Date'])) & st.session_state.expenses_df['Amount'].isin(selected_rows['Amount']) & st.session_state.expenses_df['Category'].isin(selected_rows['Category'])].index
                     st.session_state.expenses_df = st.session_state.expenses_df.drop(indices_to_delete)
                     save_data(st.session_state.expenses_df)
                     st.success(f"Successfully deleted {len(indices_to_delete)} expense(s).")
                     st.rerun()
-                else:
-                    st.warning("No expenses selected for deletion.")
-            
+                else: st.warning("No expenses selected for deletion.")
             if delete_all_button:
                 empty_df = pd.DataFrame(columns=["Date", "Category", "Amount", "Comments"])
                 st.session_state.expenses_df = empty_df
@@ -528,3 +448,11 @@ if GDRIVE_CONNECTED:
                 st.rerun()
     else:
         st.info("No expenses to manage.")
+```
+
+### ✅ Checklist to Finish:
+1.  **Update `requirements.txt`:** Add `google-generativeai`.
+2.  **Get API Key:** Get it from [Google AI Studio](https://aistudio.google.com/app/apikey).
+3.  **Add Secret:** In Streamlit Secrets (Settings > Secrets), add:
+    ```toml
+    GEMINI_API_KEY = "your-api-key-here"
